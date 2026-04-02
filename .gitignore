@@ -1,0 +1,5 @@
+.adv/
+__pycache__/
+.cursorrules
+.vscode/
+.DS_Store

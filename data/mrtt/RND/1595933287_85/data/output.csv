@@ -1,0 +1,11 @@
+,adv action,condition,git,investment,repay
+0,[3],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",10,[22.5]
+1,[0],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",15,[0.]
+2,[2],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",10,[15.]
+3,[0],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",10,[0.]
+4,[2],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",20,[30.]
+5,[0],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",2,[0.]
+6,[4],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",15,[45.]
+7,[1],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",2,[1.5]
+8,[1],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",15,[11.25]
+9,[3],"""rnd""","('9dd8eacef64ad614f017ef436b17c9ddafa0f0c2', 'vec')",10,[22.5]

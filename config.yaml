@@ -1,0 +1,65 @@
+seed: 42
+
+# --- Phase 1: Data parsing ---
+data:
+  mrtt_dir: "data/mrtt"           # contains RND/, FAIR/, MAX/ subfolders
+  train_condition: "RND"          # only RND used for learner model training
+  output_path: "data/behavioral_rnd_dataset.csv"
+  original_endowment: 20          # per-round endowment in Dezfouli MRTT
+  original_rounds: 10             # rounds per episode
+  multiplier: 3                   # investment is tripled
+
+# --- Phase 2: Behavioral RNN (learner model) ---
+behavioral_rnn:
+  hidden_size: 16                 # small GRU — Dezfouli used 3-10 cells
+  dropout: 0.20
+  input_size: 4                   # [round_scaled, prev_repay_prop, prev_invest_scaled, prev_reward_scaled]
+  n_actions: 5
+  actions: [0, 5, 10, 15, 20]    # discretized investment buckets
+  lr: 0.003
+  epochs: 120
+  batch_size: 64
+  train_frac: 0.80
+  grad_clip: 1.0
+  use_class_weights: True
+  save_path: "checkpoints/behavioral_rnn.pt"
+
+# --- Phase 3: Adversary training ---
+adversary:
+  type: "dqn"                     # swappable: "dqn", "a2c", "ppo" later
+  repayment_actions: [0.0, 0.25, 0.50, 0.75, 1.0]
+  hidden_layers: [128, 128]
+  lr: 1.0e-4
+  epsilon_start: 0.2
+  epsilon_decay: 0.9999
+  epsilon_min: 0.01
+  gamma: 0.99
+  replay_buffer_size: 400000
+  batch_size: 64
+  target_update_freq: 1000
+  training_episodes: 200000
+  eval_interval: 10000
+  eval_episodes: 2000
+  save_dir: "checkpoints/"
+  max:
+    save_path: "checkpoints/adversary_max.pt"
+  fair:
+    save_path: "checkpoints/adversary_fair.pt"
+
+# --- Phase 4: Game simulation ---
+game:
+  num_agents: 2                   # start with 2 (Fair + Max), extendable to k
+  max_rounds: 10000
+  endowment: 10000                # investor total starting wealth
+  multiplier: 3                   # funds sent are tripled
+  min_investment: 1               # investor must send >= 1 per step
+  observation_depth: 4            # d = 4 sliding window for agent observations
+
+# --- World ---
+world:
+  mode: 0                         # 0 = W0 independent, 1 = W1 coordination
+
+# --- CSV Export ---
+export:
+  output_dir: "outputs/"
+  filename: "game_log.csv"
