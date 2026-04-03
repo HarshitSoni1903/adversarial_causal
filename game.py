@@ -1,8 +1,8 @@
 """Game loop: orchestrates rounds between the frozen RNN investor and adversary agents.
 
-Handles endowments, multiplier, wealth tracking, and termination. Produces a
-full game log DataFrame matching the CSV export contract (one row per timestep
-per agent). Does NOT train models — training is a separate phase.
+Supports both single-run simulation (run()) and multi-episode training
+(run_training()). Both use _run_episode() internally to avoid duplicating
+the game loop.
 
 The investor and agent interfaces are duck-typed. The game passes observation
 components (own, others, rnn_hidden, round_scaled) separately to each agent,
@@ -10,7 +10,6 @@ letting the agent decide how to concatenate them into its DQN state vector.
 """
 
 import json
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -54,6 +53,7 @@ class Game:
         world: World,
         investor: Any,
         agents: list[Any],
+        training_mode: bool = True,
     ) -> None:
         game_cfg = config["game"]
         self.max_rounds: int = game_cfg["max_rounds"]
@@ -65,14 +65,35 @@ class Game:
         self.communication: bool = world_cfg["communication"]
         self.observation_depth: int = world_cfg["observation_depth"]
 
+        self.training_rounds: int = config["dqn"].get("training_rounds", self.max_rounds)
+
         self.world = world
         self.investor = investor
         self.agents = agents
+        self.training_mode = training_mode
         self.export_dir = Path(config["export"]["output_dir"])
         self.json_log_interval: int = config["export"].get("json_log_interval", 100)
 
-    def run(self) -> pd.DataFrame:
-        """Run the full game and return a log DataFrame."""
+    # ------------------------------------------------------------------
+    # Core episode runner
+    # ------------------------------------------------------------------
+
+    def _run_episode(
+        self, log_details: bool = False, rounds_override: int | None = None,
+    ) -> dict:
+        """Run one full game episode.
+
+        Args:
+            log_details: if True, build full DataFrame log (slower).
+            rounds_override: if set, use this instead of self.max_rounds.
+
+        Returns:
+            dict with keys: total_rounds, final_wealth, investor_cumulative,
+            agent_rewards (dict[name, float]), agent_repay_means (dict[name, float]),
+            and optionally "log_df" (pd.DataFrame) when log_details=True.
+        """
+        n_rounds = rounds_override if rounds_override is not None else self.max_rounds
+
         self.world.reset()
         self.investor.reset()
         for agent in self.agents:
@@ -80,16 +101,18 @@ class Game:
 
         investor_wealth = self.endowment
         investor_cumulative = 0.0
-        log_rows: list[dict] = []
         world_mode = 1 if self.communication else 0
-        round_denom = max(self.max_rounds - 1, 1)
+        round_denom = max(n_rounds - 1, 1)
 
-        recent_repay: dict[str, list[float]] = defaultdict(list)
+        log_rows: list[dict] = [] if log_details else []
+        repay_sums: dict[str, float] = {a.name: 0.0 for a in self.agents}
+        repay_counts: dict[str, int] = {a.name: 0 for a in self.agents}
+        total_rounds = 0
 
-        pbar = tqdm(range(self.max_rounds), desc="Round", unit="rnd")
-        for t in pbar:
+        for t in range(n_rounds):
             if investor_wealth < self.min_investment:
                 break
+            total_rounds = t + 1
 
             for agent in self.agents:
                 investment = self.investor.act(agent.name)
@@ -113,6 +136,7 @@ class Game:
                     rnn_hidden=rnn_hidden,
                     round_scaled=round_scaled,
                 )
+                repay_pct = float(np.clip(repay_pct, 0.0, 1.0))
                 repayment = repay_pct * investment_multiplied
 
                 investor_reward = repayment - investment
@@ -130,60 +154,172 @@ class Game:
                     agent.set_investor_reward(investor_reward)
                 agent.observe(agent_reward, done=False)
 
-                recent_repay[agent.name].append(repay_pct)
+                repay_sums[agent.name] += repay_pct
+                repay_counts[agent.name] += 1
 
-                if t % self.json_log_interval == 0:
-                    hidden_json = json.dumps(rnn_hidden.tolist())
-                    obs_json = json.dumps({
-                        "own": obs["own"].tolist(),
-                        "others": obs["others"].tolist(),
+                if log_details:
+                    if t % self.json_log_interval == 0:
+                        hidden_json = json.dumps(rnn_hidden.tolist())
+                        obs_json = json.dumps({
+                            "own": obs["own"].tolist(),
+                            "others": obs["others"].tolist(),
+                        })
+                    else:
+                        hidden_json = ""
+                        obs_json = ""
+
+                    log_rows.append({
+                        "timestep": t,
+                        "agent_name": agent.name,
+                        "agent_type": agent.policy,
+                        "world_mode": world_mode,
+                        "observation_depth": self.observation_depth,
+                        "investor_wealth": round(investor_wealth, 2),
+                        "investment": round(investment, 2),
+                        "investment_multiplied": round(investment_multiplied, 2),
+                        "repayment": round(repayment, 2),
+                        "repayment_pct": round(repay_pct, 2),
+                        "investor_reward": round(investor_reward, 2),
+                        "agent_reward": round(agent_reward, 2),
+                        "investor_cumulative": round(investor_cumulative, 2),
+                        "agent_cumulative": round(agent.cumulative_reward, 2),
+                        "rnn_hidden_state": hidden_json,
+                        "observation_window": obs_json,
                     })
-                else:
-                    hidden_json = ""
-                    obs_json = ""
-
-                log_rows.append({
-                    "timestep": t,
-                    "agent_name": agent.name,
-                    "agent_type": agent.policy,
-                    "world_mode": world_mode,
-                    "observation_depth": self.observation_depth,
-                    "investor_wealth": round(investor_wealth, 2),
-                    "investment": round(investment, 2),
-                    "investment_multiplied": round(investment_multiplied, 2),
-                    "repayment": round(repayment, 2),
-                    "repayment_pct": round(repay_pct, 2),
-                    "investor_reward": round(investor_reward, 2),
-                    "agent_reward": round(agent_reward, 2),
-                    "investor_cumulative": round(investor_cumulative, 2),
-                    "agent_cumulative": round(agent.cumulative_reward, 2),
-                    "rnn_hidden_state": hidden_json,
-                    "observation_window": obs_json,
-                })
-
-            if t % 100 == 99 or t == 0:
-                postfix = {"w": f"{investor_wealth:.0f}"}
-                for agent in self.agents:
-                    buf = recent_repay[agent.name][-100:]
-                    avg_r = np.mean(buf) if buf else 0.0
-                    postfix[agent.name] = (
-                        f"{'+' if agent.cumulative_reward >= 0 else ''}"
-                        f"{agent.cumulative_reward:.0f}"
-                        f"(r={avg_r:.2f})"
-                    )
-                pbar.set_postfix(postfix)
 
             if investor_wealth < self.min_investment:
                 break
 
-        pbar.close()
-
         for agent in self.agents:
             agent.observe(0.0, done=True)
 
-        log_df = pd.DataFrame(log_rows)
+        result: dict[str, Any] = {
+            "total_rounds": total_rounds,
+            "final_wealth": investor_wealth,
+            "investor_cumulative": investor_cumulative,
+            "agent_rewards": {a.name: a.cumulative_reward for a in self.agents},
+            "agent_repay_means": {
+                a.name: repay_sums[a.name] / max(repay_counts[a.name], 1)
+                for a in self.agents
+            },
+        }
+        if log_details:
+            result["log_df"] = pd.DataFrame(log_rows)
+        return result
+
+    # ------------------------------------------------------------------
+    # Public: single simulation run with full logging
+    # ------------------------------------------------------------------
+
+    def run(self) -> pd.DataFrame:
+        """Run a single game with full DataFrame logging and summary plot."""
+        result = self._run_episode(log_details=True)
+        log_df = result["log_df"]
         self._save_summary_plot(log_df)
         return log_df
+
+    # ------------------------------------------------------------------
+    # Public: multi-episode training
+    # ------------------------------------------------------------------
+
+    def run_training(
+        self,
+        num_episodes: int,
+        eval_interval: int = 100,
+        eval_episodes: int = 10,
+    ) -> dict:
+        """Run multiple episodes for online adversary training.
+
+        Returns dict with training_returns (list of per-episode agent rewards)
+        and eval_history (list of eval snapshots).
+        """
+        training_returns: list[dict] = []
+        eval_history: list[dict] = []
+
+        pbar = tqdm(range(1, num_episodes + 1), desc="Training", unit="ep")
+        for ep in pbar:
+            stats = self._run_episode(log_details=False, rounds_override=self.training_rounds)
+            training_returns.append(stats["agent_rewards"])
+
+            for agent in self.agents:
+                if hasattr(agent, "q_learner"):
+                    agent.q_learner.decay_epsilon()
+
+            eps_val = self._get_epsilon()
+            if ep % 10 == 0 or ep == 1:
+                postfix: dict[str, str] = {
+                    "w": f"{stats['final_wealth']:.0f}",
+                    "eps": f"{eps_val:.3f}",
+                }
+                for a in self.agents:
+                    r = stats["agent_rewards"][a.name]
+                    postfix[a.name] = f"{'+' if r >= 0 else ''}{r:.0f}"
+                pbar.set_postfix(postfix)
+
+            if ep % eval_interval == 0:
+                eval_stats = self._run_eval(eval_episodes)
+                eval_history.append({"episode": ep, **eval_stats})
+                print(
+                    f"  [Eval @ ep {ep}] "
+                    f"mean_wealth={eval_stats['mean_wealth']:.0f}  "
+                    + "  ".join(
+                        f"{a.name}={eval_stats['mean_agent_rewards'][a.name]:+.0f}"
+                        f"(r={eval_stats['mean_agent_repay'][a.name]:.2f})"
+                        for a in self.agents
+                    )
+                )
+
+        pbar.close()
+
+        for agent in self.agents:
+            if hasattr(agent, "save"):
+                agent.save()
+                print(f"Saved {agent.name} weights")
+
+        return {"training_returns": training_returns, "eval_history": eval_history}
+
+    def _run_eval(self, num_episodes: int) -> dict:
+        """Run evaluation episodes with agents in eval mode."""
+        for agent in self.agents:
+            if hasattr(agent, "set_eval_mode"):
+                agent.set_eval_mode(True)
+
+        wealth_list: list[float] = []
+        agent_rewards_list: list[dict[str, float]] = []
+        agent_repay_list: list[dict[str, float]] = []
+
+        for _ in range(num_episodes):
+            stats = self._run_episode(log_details=False, rounds_override=self.training_rounds)
+            wealth_list.append(stats["final_wealth"])
+            agent_rewards_list.append(stats["agent_rewards"])
+            agent_repay_list.append(stats["agent_repay_means"])
+
+        for agent in self.agents:
+            if hasattr(agent, "set_eval_mode"):
+                agent.set_eval_mode(False)
+
+        return {
+            "mean_wealth": float(np.mean(wealth_list)),
+            "mean_agent_rewards": {
+                a.name: float(np.mean([r[a.name] for r in agent_rewards_list]))
+                for a in self.agents
+            },
+            "mean_agent_repay": {
+                a.name: float(np.mean([r[a.name] for r in agent_repay_list]))
+                for a in self.agents
+            },
+        }
+
+    def _get_epsilon(self) -> float:
+        """Get current epsilon from the first DQN agent, or 0 if none."""
+        for agent in self.agents:
+            if hasattr(agent, "q_learner"):
+                return agent.q_learner.epsilon
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
 
     def _save_summary_plot(self, log_df: pd.DataFrame) -> None:
         """Save investor wealth and agent cumulative reward plots."""

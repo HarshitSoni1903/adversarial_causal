@@ -7,9 +7,17 @@ reward signal used for Q-learning:
 - FAIR: rl_reward = 0 every step except the final one, where
   rl_reward = -|agent_total - investor_total|.
 
-Per-agent parameters in agent_cfg override global dqn defaults. To add a
-new customizable parameter, just add it to the agent's config entry in YAML —
-no code changes needed.
+Learns online during the game via delayed transition storage:
+
+  Step t:  act()     → receives state_t, picks action_t, caches them
+  Step t:  observe() → receives reward_t, caches it
+  Step t+1: act()    → receives state_{t+1}, NOW stores (state_t, action_t,
+                        reward_t, state_{t+1}, False) and calls q_learner.update()
+
+On the final step (done=True in observe()), the terminal transition is
+stored immediately with done=True.
+
+Per-agent parameters in agent_cfg override global dqn defaults.
 
 The game loop must call set_investor_reward() after each step so the FAIR
 agent can track the investor's running total.
@@ -41,10 +49,13 @@ class DQNAdversary(BaseAgent):
             ),
         )
         self.q_learner = QLearner(state_dim, num_actions, dqn_cfg)
+        self.eval_mode: bool = False
 
         self._prev_state: np.ndarray | None = None
-        self._prev_action: int = 0
-        self._pending_reward: float = 0.0
+        self._prev_action: int | None = None
+        self._prev_reward: float = 0.0
+        self._current_state: np.ndarray | None = None
+
         self._episode_agent_total = 0.0
         self._episode_investor_total = 0.0
         self._last_investment_received = 0.0
@@ -56,28 +67,38 @@ class DQNAdversary(BaseAgent):
         rnn_hidden: np.ndarray,
         round_scaled: float,
     ) -> float:
-        """Assemble state, select action, return repayment proportion."""
+        """Assemble state, select action, return repayment proportion.
+
+        If a previous transition is pending (prev_state from step t-1),
+        this call provides state_{t} as the next_state to complete and
+        store that transition.
+        """
         state = np.concatenate([
             own_obs, others_obs, rnn_hidden, [round_scaled],
         ]).astype(np.float32)
 
-        action_idx = self.q_learner.select_action(state)
-
-        if self._prev_state is not None:
+        if not self.eval_mode and self._prev_state is not None:
             self.q_learner.store_transition(
-                self._prev_state, self._prev_action, self._pending_reward,
+                self._prev_state, self._prev_action, self._prev_reward,
                 state, False,
             )
             self.q_learner.update()
 
+        action_idx = self.q_learner.select_action(state, greedy=self.eval_mode)
+
+        self._current_state = state
         self._prev_state = state
         self._prev_action = action_idx
-        self._pending_reward = 0.0
+        self._prev_reward = 0.0
 
         return self.repayment_actions[action_idx]
 
     def observe(self, reward: float, done: bool) -> None:
-        """Compute policy-specific reward and store terminal transition if done."""
+        """Receive reward and compute policy-specific RL signal.
+
+        Caches the reward for the delayed transition (stored in the next act()).
+        On done=True, stores the terminal transition immediately.
+        """
         if self.policy == "max":
             rl_reward = reward
         elif self.policy == "fair":
@@ -90,16 +111,17 @@ class DQNAdversary(BaseAgent):
             rl_reward = reward
 
         if done:
-            if self._prev_state is not None:
+            if not self.eval_mode and self._prev_state is not None:
                 terminal_state = np.zeros_like(self._prev_state)
                 self.q_learner.store_transition(
                     self._prev_state, self._prev_action, rl_reward,
                     terminal_state, True,
                 )
                 self.q_learner.update()
-                self._prev_state = None
+            self._prev_state = None
+            self._prev_action = None
         else:
-            self._pending_reward = rl_reward
+            self._prev_reward = rl_reward
 
     def set_investor_reward(self, investor_reward: float) -> None:
         """Called by game.py after each step so FAIR can track investor earnings."""
@@ -109,11 +131,17 @@ class DQNAdversary(BaseAgent):
         """Called by game.py before act() with the tripled investment amount."""
         self._last_investment_received = investment_multiplied
 
+    def set_eval_mode(self, mode: bool = True) -> None:
+        """Toggle evaluation mode: greedy actions, no learning."""
+        self.eval_mode = mode
+
     def reset(self) -> None:
+        """Reset episode state. Q-learner weights persist across episodes."""
         super().reset()
         self._prev_state = None
-        self._prev_action = 0
-        self._pending_reward = 0.0
+        self._prev_action = None
+        self._prev_reward = 0.0
+        self._current_state = None
         self._episode_agent_total = 0.0
         self._episode_investor_total = 0.0
         self._last_investment_received = 0.0
@@ -125,8 +153,3 @@ class DQNAdversary(BaseAgent):
     def load(self, path: str | None = None) -> None:
         path = path or f"{self.config['dqn']['save_dir']}{self.name}.pt"
         self.q_learner.load(path)
-
-    def set_greedy(self, greedy: bool = True) -> None:
-        """Set epsilon to 0 for pure exploitation (simulation mode)."""
-        if greedy:
-            self.q_learner.epsilon = 0.0

@@ -41,10 +41,11 @@ class QLearner:
 
     def __init__(
         self, state_dim: int, action_dim: int, config: dict,
+        device: str = "cpu",
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device)
 
         hidden_layers: list[int] = config.get("hidden_layers", [128, 128])
         self.gamma: float = config.get("gamma", 0.99)
@@ -62,7 +63,9 @@ class QLearner:
         self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
-        self.buffer: deque[tuple[np.ndarray, int, float, np.ndarray, bool]] = deque(maxlen=buf_size)
+        self._buffer_list: list[tuple[np.ndarray, int, float, np.ndarray, bool]] = []
+        self._buffer_max: int = buf_size
+        self._buffer_idx: int = 0
         self.step_count = 0
 
     def select_action(self, state: np.ndarray, greedy: bool = False) -> int:
@@ -83,14 +86,24 @@ class QLearner:
         next_state: np.ndarray,
         done: bool,
     ) -> None:
-        self.buffer.append((state, action, reward, next_state, done))
+        transition = (state, action, reward, next_state, done)
+        if len(self._buffer_list) < self._buffer_max:
+            self._buffer_list.append(transition)
+        else:
+            self._buffer_list[self._buffer_idx] = transition
+        self._buffer_idx = (self._buffer_idx + 1) % self._buffer_max
 
     def update(self) -> float | None:
-        """Sample a batch, compute TD loss, and step. Returns loss or None if buffer too small."""
-        if len(self.buffer) < self.batch_size:
+        """Sample a batch, compute TD loss, and step. Returns loss or None if buffer too small.
+
+        Does NOT decay epsilon — call decay_epsilon() once per episode instead.
+        """
+        buf_len = len(self._buffer_list)
+        if buf_len < self.batch_size:
             return None
 
-        batch = random.sample(list(self.buffer), self.batch_size)
+        indices = np.random.randint(0, buf_len, size=self.batch_size)
+        batch = [self._buffer_list[i] for i in indices]
         states, actions, rewards, next_states, dones = zip(*batch)
 
         s = torch.tensor(np.array(states), dtype=torch.float32, device=self.device)
@@ -114,9 +127,11 @@ class QLearner:
         if self.step_count % self.target_update_freq == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
         return loss.item()
+
+    def decay_epsilon(self) -> None:
+        """Decay epsilon once per episode. Call at the end of each training episode."""
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -131,9 +146,10 @@ class QLearner:
         }, path)
 
     def load(self, path: str) -> None:
+        """Load saved state. Sets epsilon to epsilon_min for evaluation."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.policy_net.load_state_dict(ckpt["policy_state_dict"])
         self.target_net.load_state_dict(ckpt["target_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.epsilon = ckpt.get("epsilon", self.epsilon_min)
+        self.epsilon = self.epsilon_min
         self.step_count = ckpt.get("step_count", 0)

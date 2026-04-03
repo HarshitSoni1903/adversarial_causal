@@ -1,14 +1,19 @@
-"""Entry point: wires together all components and runs the simulation pipeline.
+"""Entry point: wires together all components and runs the pipeline.
 
-Currently implements a 'simulate' mode that runs the frozen RNN investor
-against adversary agents in the trust game and exports the full game log
-to CSV for downstream analysis in R.
+Usage:
+    python main.py train      # Train adversaries online, save weights
+    python main.py simulate   # Load trained weights, run one game, export CSV
 """
 
+import argparse
 import json
 import tempfile
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 from agents import create_all_agents
@@ -18,10 +23,8 @@ from utils import load_config, set_all_seeds
 from world import World
 
 
-def main() -> None:
-    cfg = load_config()
-    set_all_seeds(cfg["seed"])
-
+def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
+    """Build world, agents, investor, and compute state_dim."""
     agent_names = [a["name"] for a in cfg["agents"]]
 
     world = World(
@@ -42,15 +45,53 @@ def main() -> None:
     investor = RNNInvestor(cfg, agent_names)
     print("Investor loaded (frozen BehavioralRNN)")
 
-    game = Game(cfg, world, investor, agents)
-    print(f"Game configured: endowment={cfg['game']['endowment']}, "
-          f"max_rounds={cfg['game']['max_rounds']}, "
-          f"multiplier={cfg['game']['multiplier']}")
+    return world, agents, investor, state_dim
 
-    print("\nRunning simulation...")
-    log_df = game.run()
 
-    # --- Export CSV atomically ---
+def _save_training_curves(
+    training_stats: dict, agents: list, save_dir: Path,
+) -> None:
+    """Save per-agent training return curves."""
+    returns = training_stats["training_returns"]
+    if not returns:
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    window = max(1, len(returns) // 50)
+    for agent in agents:
+        vals = [r[agent.name] for r in returns]
+        smoothed = np.convolve(vals, np.ones(window) / window, mode="valid")
+        ax1.plot(smoothed, label=f"{agent.name} ({agent.policy})", alpha=0.8)
+    ax1.set_xlabel("Episode")
+    ax1.set_ylabel("Cumulative Reward (smoothed)")
+    ax1.set_title("Training Returns")
+    ax1.legend()
+
+    eval_hist = training_stats["eval_history"]
+    if eval_hist:
+        eps = [e["episode"] for e in eval_hist]
+        ax2.plot(eps, [e["mean_wealth"] for e in eval_hist], "k-", label="investor wealth")
+        for agent in agents:
+            ax2.plot(
+                eps,
+                [e["mean_agent_rewards"][agent.name] for e in eval_hist],
+                label=agent.name, alpha=0.8,
+            )
+        ax2.set_xlabel("Episode")
+        ax2.set_ylabel("Mean Reward / Wealth")
+        ax2.set_title("Evaluation Snapshots")
+        ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_dir / "training_curves.png", dpi=150)
+    plt.close(fig)
+    print(f"Training curves saved to {save_dir / 'training_curves.png'}")
+
+
+def _export_csv(log_df: pd.DataFrame, cfg: dict) -> None:
+    """Export game log atomically."""
     export_cfg = cfg["export"]
     out_dir = Path(export_cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -62,9 +103,11 @@ def main() -> None:
         log_df.to_csv(tmp, index=False)
         tmp_path = Path(tmp.name)
     tmp_path.rename(out_path)
-    print(f"\nGame log saved to {out_path}  ({len(log_df)} rows)")
+    print(f"Game log saved to {out_path}  ({len(log_df)} rows)")
 
-    # --- Summary ---
+
+def _print_summary(log_df: pd.DataFrame, agents: list) -> None:
+    """Print simulation summary."""
     if log_df.empty:
         print("No rounds played.")
         return
@@ -75,7 +118,7 @@ def main() -> None:
     print(f"\n{'='*50}")
     print("SIMULATION SUMMARY")
     print(f"{'='*50}")
-    print(f"  Total rounds:       {total_rounds}")
+    print(f"  Total rounds:          {total_rounds}")
     print(f"  Final investor wealth: {final_wealth:.2f}")
     print(f"  Investor cumulative:   {log_df['investor_cumulative'].iloc[-1]:.2f}")
 
@@ -86,7 +129,6 @@ def main() -> None:
         print(f"  {agent.name:<12} {agent.policy:<8} "
               f"{agent.cumulative_reward:>12.2f} {mean_repay:>11.1%}")
 
-    # --- Quick validation ---
     expected_cols = [
         "timestep", "agent_name", "agent_type", "world_mode",
         "observation_depth", "investor_wealth", "investment",
@@ -100,10 +142,85 @@ def main() -> None:
     else:
         print(f"\n  CSV columns: OK ({len(expected_cols)} expected)")
 
-    sample_hidden = json.loads(log_df["rnn_hidden_state"].iloc[0])
-    sample_obs = json.loads(log_df["observation_window"].iloc[0])
+    first_json_row = log_df[log_df["rnn_hidden_state"] != ""].iloc[0]
+    sample_hidden = json.loads(first_json_row["rnn_hidden_state"])
+    sample_obs = json.loads(first_json_row["observation_window"])
     print(f"  rnn_hidden_state: valid JSON, length={len(sample_hidden)}")
     print(f"  observation_window: valid JSON, keys={list(sample_obs.keys())}")
+
+
+# ------------------------------------------------------------------
+# Modes
+# ------------------------------------------------------------------
+
+def cmd_train(cfg: dict) -> None:
+    """Train adversaries online against frozen RNN investor."""
+    world, agents, investor, _ = _build_components(cfg)
+    dqn_cfg = cfg["dqn"]
+
+    game = Game(cfg, world, investor, agents, training_mode=True)
+    print(f"Game configured: endowment={cfg['game']['endowment']}, "
+          f"max_rounds={cfg['game']['max_rounds']}, "
+          f"multiplier={cfg['game']['multiplier']}")
+
+    num_episodes = dqn_cfg["training_episodes"]
+    eval_interval = dqn_cfg["eval_interval"]
+    eval_episodes = dqn_cfg["eval_episodes"]
+    print(f"\nTraining: {num_episodes} episodes, "
+          f"eval every {eval_interval} ({eval_episodes} eval episodes)")
+
+    stats = game.run_training(
+        num_episodes=num_episodes,
+        eval_interval=eval_interval,
+        eval_episodes=eval_episodes,
+    )
+
+    out_dir = Path(cfg["export"]["output_dir"])
+    _save_training_curves(stats, agents, out_dir)
+
+
+def cmd_simulate(cfg: dict) -> None:
+    """Load trained weights, run one game, export CSV."""
+    world, agents, investor, _ = _build_components(cfg)
+
+    for agent in agents:
+        if hasattr(agent, "load"):
+            try:
+                agent.load()
+                print(f"Loaded weights for {agent.name}")
+            except FileNotFoundError:
+                print(f"  WARNING: No checkpoint for {agent.name}, using random weights")
+        if hasattr(agent, "set_eval_mode"):
+            agent.set_eval_mode(True)
+
+    game = Game(cfg, world, investor, agents, training_mode=False)
+    print(f"Game configured: endowment={cfg['game']['endowment']}, "
+          f"max_rounds={cfg['game']['max_rounds']}, "
+          f"multiplier={cfg['game']['multiplier']}")
+
+    print("\nRunning simulation (eval mode)...")
+    log_df = game.run()
+
+    _export_csv(log_df, cfg)
+    _print_summary(log_df, agents)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Adversarial MRTT Pipeline")
+    parser.add_argument(
+        "mode", nargs="?", default="train",
+        choices=["train", "simulate"],
+        help="'train' to train adversaries, 'simulate' to run with trained weights (default: train)",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config()
+    set_all_seeds(cfg["seed"])
+
+    if args.mode == "train":
+        cmd_train(cfg)
+    elif args.mode == "simulate":
+        cmd_simulate(cfg)
 
 
 if __name__ == "__main__":

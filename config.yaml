@@ -41,11 +41,11 @@ game:
 agents:
   - name: "fair_1"
     policy: "fair"
-    repayment_actions: [0.25, 0.50, 0.75, 1.0]     # must return at least 25%
+    repayment_actions: [0.10, 0.25, 0.50, 0.75, 1.0]     # must return at least 10%
 
   - name: "max_1"
     policy: "max"
-    repayment_actions: [0.0, 0.10, 0.25, 0.50]      # can be stingy, max 50% return
+    repayment_actions: [0.0, 0.10, 0.25, 0.50, 0.75]     # can be stingy, max 75% return
 
   - name: "rnd_1"
     policy: "random"
@@ -58,15 +58,16 @@ dqn:
   hidden_layers: [128, 128]
   lr: 1.0e-4
   epsilon_start: 0.2
-  epsilon_decay: 0.9999
+  epsilon_decay: 0.99              # per-episode decay rate
   epsilon_min: 0.01
   gamma: 0.99
   replay_buffer_size: 400000
   batch_size: 64
   target_update_freq: 1000
-  training_episodes: 200000
-  eval_interval: 10000
-  eval_episodes: 2000
+  training_episodes: 100          # number of full games for training
+  training_rounds: 10000          # rounds per training episode
+  eval_interval: 10               # evaluate every N episodes
+  eval_episodes: 5                # games per evaluation
   save_dir: "checkpoints/"
 
 # --- CSV Export ---
