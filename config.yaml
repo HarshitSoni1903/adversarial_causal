@@ -11,23 +11,50 @@ data:
 
 # --- Phase 2: Behavioral RNN (learner model) ---
 behavioral_rnn:
-  hidden_size: 16                 # small GRU — Dezfouli used 3-10 cells
-  dropout: 0.20
+  hidden_size: 64                 # small GRU — Dezfouli used 3-10 cells
+  dropout: 0.1204
   input_size: 4                   # [round_scaled, prev_repay_prop, prev_invest_scaled, prev_reward_scaled]
   n_actions: 5
   actions: [0, 5, 10, 15, 20]    # discretized investment buckets
-  lr: 0.003
-  epochs: 120
-  batch_size: 64
+  lr: 0.009857
+  epochs: 200
+  batch_size: 128
   train_frac: 0.80
-  grad_clip: 1.0
+  grad_clip: 1.8920
   use_class_weights: True
   save_path: "checkpoints/behavioral_rnn.pt"
 
-# --- Phase 3: Adversary training ---
-adversary:
-  type: "dqn"                     # swappable: "dqn", "a2c", "ppo" later
-  repayment_actions: [0.0, 0.25, 0.50, 0.75, 1.0]
+# --- World ---
+world:
+  communication: false            # false=W0 (others zeroed), true=W1 (others visible)
+  observation_depth: 4            # d: agent's own last d steps
+
+# --- Phase 4: Game simulation ---
+game:
+  max_rounds: 10000
+  endowment: 10000                # investor total starting wealth
+  multiplier: 3                   # funds sent are tripled
+  min_investment: 1               # investor must send >= 1 per step
+
+# Each entry defines one adversary agent. Add or remove freely.
+# Per-agent params override global dqn defaults.
+agents:
+  - name: "fair_1"
+    policy: "fair"
+    repayment_actions: [0.25, 0.50, 0.75, 1.0]     # must return at least 25%
+
+  - name: "max_1"
+    policy: "max"
+    repayment_actions: [0.0, 0.10, 0.25, 0.50]      # can be stingy, max 50% return
+
+  - name: "rnd_1"
+    policy: "random"
+    repayment_actions: [0.0, 0.25, 0.50, 0.75, 1.0]  # full range
+
+# --- Phase 3: Shared DQN hyperparams for all non-random agents ---
+# Per-agent entries override these defaults.
+dqn:
+  repayment_actions: [0.0, 0.25, 0.50, 0.75, 1.0]  # default action space
   hidden_layers: [128, 128]
   lr: 1.0e-4
   epsilon_start: 0.2
@@ -41,25 +68,9 @@ adversary:
   eval_interval: 10000
   eval_episodes: 2000
   save_dir: "checkpoints/"
-  max:
-    save_path: "checkpoints/adversary_max.pt"
-  fair:
-    save_path: "checkpoints/adversary_fair.pt"
-
-# --- Phase 4: Game simulation ---
-game:
-  num_agents: 2                   # start with 2 (Fair + Max), extendable to k
-  max_rounds: 10000
-  endowment: 10000                # investor total starting wealth
-  multiplier: 3                   # funds sent are tripled
-  min_investment: 1               # investor must send >= 1 per step
-  observation_depth: 4            # d = 4 sliding window for agent observations
-
-# --- World ---
-world:
-  mode: 0                         # 0 = W0 independent, 1 = W1 coordination
 
 # --- CSV Export ---
 export:
   output_dir: "outputs/"
   filename: "game_log.csv"
+  json_log_interval: 100          # serialize rnn_hidden & obs every N steps
