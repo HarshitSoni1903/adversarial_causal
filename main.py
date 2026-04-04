@@ -3,6 +3,10 @@
 Usage:
     python main.py train      # Train adversaries online, save weights
     python main.py simulate   # Load trained weights, run one game, export CSV
+
+Outputs are organized by world mode:
+    outputs/w0/   — communication=false results
+    outputs/w1/   — communication=true results
 """
 
 import argparse
@@ -19,8 +23,17 @@ import pandas as pd
 from agents import create_all_agents
 from agents.investor import RNNInvestor
 from game import Game
-from utils import load_config, set_all_seeds
+from utils import get_checkpoint_dir, load_config, set_all_seeds
 from world import World
+
+
+def _get_output_dir(cfg: dict) -> Path:
+    """Return world-mode-specific output directory (outputs/w0/ or outputs/w1/)."""
+    base = Path(cfg["export"]["output_dir"])
+    mode = "w1" if cfg["world"]["communication"] else "w0"
+    out = base / mode
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 
 def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
@@ -45,7 +58,7 @@ def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
     investor = RNNInvestor(cfg, agent_names)
     if investor.learns:
         k = len(agent_names)
-        ql_state_dim = rnn_hidden_size * k + 2 * k + 2
+        ql_state_dim = k + rnn_hidden_size * k + 2 * k + 2
         print(f"Investor loaded (frozen RNN + Q-learner, state_dim={ql_state_dim})")
     else:
         print("Investor loaded (frozen BehavioralRNN)")
@@ -56,15 +69,16 @@ def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
 def _save_training_curves(
     training_stats: dict, agents: list, save_dir: Path,
 ) -> None:
-    """Save per-participant training return curves (investor + agents)."""
+    """Save training curves: smoothed returns + per-episode returns + repayment rates."""
     returns = training_stats["training_returns"]
     if not returns:
         return
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
     window = max(1, len(returns) // 50)
+
+    # --- Plot 1: Training returns (smoothed) + eval snapshots ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
 
     inv_vals = [r["investor_return"] for r in returns]
     inv_smooth = np.convolve(inv_vals, np.ones(window) / window, mode="valid")
@@ -82,7 +96,8 @@ def _save_training_curves(
     eval_hist = training_stats["eval_history"]
     if eval_hist:
         eps = [e["episode"] for e in eval_hist]
-        ax2.plot(eps, [e["mean_wealth"] for e in eval_hist], "k-", label="investor wealth")
+        ax2.plot(eps, [e["mean_wealth"] for e in eval_hist], "k-",
+                 label="investor wealth", linewidth=1.5)
         for agent in agents:
             ax2.plot(
                 eps,
@@ -97,15 +112,59 @@ def _save_training_curves(
     plt.tight_layout()
     plt.savefig(save_dir / "training_curves.png", dpi=150)
     plt.close(fig)
-    print(f"Training curves saved to {save_dir / 'training_curves.png'}")
+
+    # --- Plot 2: Per-episode raw returns (with smoothed overlay) ---
+    fig2, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    ax = axes[0, 0]
+    ax.plot(inv_vals, alpha=0.3, color="black", linewidth=0.5)
+    ax.plot(inv_smooth, color="black", linewidth=1.5)
+    ax.set_title("Investor Return per Episode")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Return")
+
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]
+    for i, agent in enumerate(agents[:3]):
+        ax = axes[(i + 1) // 2, (i + 1) % 2]
+        vals = [r[agent.name] for r in returns]
+        smoothed = np.convolve(vals, np.ones(window) / window, mode="valid")
+        c = colors[i % len(colors)]
+        ax.plot(vals, alpha=0.3, color=c, linewidth=0.5)
+        ax.plot(smoothed, color=c, linewidth=1.5)
+        ax.set_title(f"{agent.name} ({agent.policy}) Return per Episode")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Return")
+
+    plt.tight_layout()
+    plt.savefig(save_dir / "per_episode_returns.png", dpi=150)
+    plt.close(fig2)
+
+    # --- Plot 3: Repayment rates from eval snapshots ---
+    if eval_hist:
+        fig3, ax3 = plt.subplots(figsize=(10, 5))
+        eps = [e["episode"] for e in eval_hist]
+        for agent in agents:
+            ax3.plot(
+                eps,
+                [e["mean_agent_repay"][agent.name] for e in eval_hist],
+                label=f"{agent.name} ({agent.policy})", marker="o", markersize=3,
+            )
+        ax3.set_xlabel("Episode")
+        ax3.set_ylabel("Mean Repayment %")
+        ax3.set_title("Agent Repayment Rates Over Training")
+        ax3.legend()
+        ax3.set_ylim(-0.05, 1.05)
+        plt.tight_layout()
+        plt.savefig(save_dir / "repayment_rates.png", dpi=150)
+        plt.close(fig3)
+
+    print(f"Training curves saved to {save_dir}/")
 
 
 def _export_csv(log_df: pd.DataFrame, cfg: dict) -> None:
-    """Export game log atomically."""
-    export_cfg = cfg["export"]
-    out_dir = Path(export_cfg["output_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / export_cfg["filename"]
+    """Export game log atomically to world-mode-specific output folder."""
+    out_dir = _get_output_dir(cfg)
+    out_path = out_dir / cfg["export"]["filename"]
 
     with tempfile.NamedTemporaryFile(
         mode="w", dir=out_dir, suffix=".csv", delete=False,
@@ -116,28 +175,30 @@ def _export_csv(log_df: pd.DataFrame, cfg: dict) -> None:
     print(f"Game log saved to {out_path}  ({len(log_df)} rows)")
 
 
-def _print_summary(log_df: pd.DataFrame, agents: list) -> None:
-    """Print simulation summary."""
+def _build_summary(log_df: pd.DataFrame, agents: list, cfg: dict) -> str:
+    """Build simulation summary as a string."""
     if log_df.empty:
-        print("No rounds played.")
-        return
+        return "No rounds played."
 
+    lines = []
     total_rounds = log_df["timestep"].max() + 1
     final_wealth = log_df["investor_wealth"].iloc[-1]
+    mode = "W1 (communication)" if cfg["world"]["communication"] else "W0 (independent)"
 
-    print(f"\n{'='*50}")
-    print("SIMULATION SUMMARY")
-    print(f"{'='*50}")
-    print(f"  Total rounds:          {total_rounds}")
-    print(f"  Final investor wealth: {final_wealth:.2f}")
-    print(f"  Investor cumulative:   {log_df['investor_cumulative'].iloc[-1]:.2f}")
-
-    print(f"\n  {'Agent':<12} {'Policy':<8} {'Cumulative':>12} {'Mean Repay%':>12}")
+    lines.append(f"{'='*60}")
+    lines.append("SIMULATION SUMMARY")
+    lines.append(f"{'='*60}")
+    lines.append(f"  World mode:            {mode}")
+    lines.append(f"  Total rounds:          {total_rounds}")
+    lines.append(f"  Final investor wealth: {final_wealth:.2f}")
+    lines.append(f"  Investor cumulative:   {log_df['investor_cumulative'].iloc[-1]:.2f}")
+    lines.append("")
+    lines.append(f"  {'Agent':<12} {'Policy':<8} {'Cumulative':>12} {'Mean Repay%':>12}")
     for agent in agents:
         agent_rows = log_df[log_df["agent_name"] == agent.name]
         mean_repay = agent_rows["repayment_pct"].mean()
-        print(f"  {agent.name:<12} {agent.policy:<8} "
-              f"{agent.cumulative_reward:>12.2f} {mean_repay:>11.1%}")
+        lines.append(f"  {agent.name:<12} {agent.policy:<8} "
+                      f"{agent.cumulative_reward:>12.2f} {mean_repay:>11.1%}")
 
     expected_cols = [
         "timestep", "agent_name", "agent_type", "world_mode",
@@ -148,15 +209,54 @@ def _print_summary(log_df: pd.DataFrame, agents: list) -> None:
     ]
     missing = set(expected_cols) - set(log_df.columns)
     if missing:
-        print(f"\n  WARNING: Missing columns: {missing}")
+        lines.append(f"\n  WARNING: Missing columns: {missing}")
     else:
-        print(f"\n  CSV columns: OK ({len(expected_cols)} expected)")
+        lines.append(f"\n  CSV columns: OK ({len(expected_cols)} expected)")
 
-    first_json_row = log_df[log_df["rnn_hidden_state"] != ""].iloc[0]
-    sample_hidden = json.loads(first_json_row["rnn_hidden_state"])
-    sample_obs = json.loads(first_json_row["observation_window"])
-    print(f"  rnn_hidden_state: valid JSON, length={len(sample_hidden)}")
-    print(f"  observation_window: valid JSON, keys={list(sample_obs.keys())}")
+    json_rows = log_df[log_df["rnn_hidden_state"] != ""]
+    if not json_rows.empty:
+        first_json_row = json_rows.iloc[0]
+        sample_hidden = json.loads(first_json_row["rnn_hidden_state"])
+        sample_obs = json.loads(first_json_row["observation_window"])
+        lines.append(f"  rnn_hidden_state: valid JSON, length={len(sample_hidden)}")
+        lines.append(f"  observation_window: valid JSON, keys={list(sample_obs.keys())}")
+
+    return "\n".join(lines)
+
+
+def _build_training_summary(
+    stats: dict, agents: list, cfg: dict, game: Game,
+) -> str:
+    """Build training summary as a string."""
+    lines = []
+    returns = stats["training_returns"]
+    mode = "W1 (communication)" if cfg["world"]["communication"] else "W0 (independent)"
+
+    lines.append(f"\n{'='*60}")
+    lines.append("TRAINING COMPLETE")
+    lines.append(f"{'='*60}")
+    lines.append(f"  World mode:     {mode}")
+    lines.append(f"  Episodes:       {len(returns)}")
+    lines.append(f"  Final epsilon:  {game._get_epsilon():.4f}")
+
+    last_10 = returns[-10:] if len(returns) >= 10 else returns
+    lines.append(f"\n  Last 10 episodes (mean):")
+    lines.append(f"    Investor return: "
+                 f"{np.mean([r['investor_return'] for r in last_10]):+.0f}")
+    for agent in agents:
+        mean_r = np.mean([r[agent.name] for r in last_10])
+        lines.append(f"    {agent.name} ({agent.policy}): {mean_r:+.0f}")
+
+    if stats["eval_history"]:
+        last_eval = stats["eval_history"][-1]
+        lines.append(f"\n  Last eval (ep {last_eval['episode']}):")
+        lines.append(f"    Mean wealth: {last_eval['mean_wealth']:.0f}")
+        for agent in agents:
+            r = last_eval["mean_agent_rewards"][agent.name]
+            rp = last_eval["mean_agent_repay"][agent.name]
+            lines.append(f"    {agent.name}: reward={r:+.0f}  repay={rp:.2f}")
+
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------
@@ -185,30 +285,15 @@ def cmd_train(cfg: dict) -> None:
         eval_episodes=eval_episodes,
     )
 
-    out_dir = Path(cfg["export"]["output_dir"])
+    out_dir = _get_output_dir(cfg)
     _save_training_curves(stats, agents, out_dir)
-    # Print final training summary
-    print(f"\n{'='*50}")
-    print("TRAINING COMPLETE")
-    print(f"{'='*50}")
-    returns = stats["training_returns"]
-    last_10 = returns[-10:] if len(returns) >= 10 else returns
-    print(f"  Episodes: {len(returns)}")
-    print(f"  Final epsilon: {game._get_epsilon():.4f}")
-    print(f"\n  Last 10 episodes (mean):")
-    print(f"    Investor return: {np.mean([r['investor_return'] for r in last_10]):+.0f}")
-    for agent in agents:
-        mean_r = np.mean([r[agent.name] for r in last_10])
-        print(f"    {agent.name} ({agent.policy}): {mean_r:+.0f}")
 
-    if stats["eval_history"]:
-        last_eval = stats["eval_history"][-1]
-        print(f"\n  Last eval (ep {last_eval['episode']}):")
-        print(f"    Mean wealth: {last_eval['mean_wealth']:.0f}")
-        for agent in agents:
-            r = last_eval['mean_agent_rewards'][agent.name]
-            rp = last_eval['mean_agent_repay'][agent.name]
-            print(f"    {agent.name}: reward={r:+.0f}  repay={rp:.2f}")
+    # Print and save training summary
+    summary = _build_training_summary(stats, agents, cfg, game)
+    print(summary)
+    summary_path = out_dir / "training_summary.txt"
+    summary_path.write_text(summary)
+    print(f"Summary saved to {summary_path}")
 
 
 def cmd_simulate(cfg: dict) -> None:
@@ -242,7 +327,14 @@ def cmd_simulate(cfg: dict) -> None:
     log_df = game.run()
 
     _export_csv(log_df, cfg)
-    _print_summary(log_df, agents)
+
+    # Print and save simulation summary
+    summary = _build_summary(log_df, agents, cfg)
+    print(summary)
+    out_dir = _get_output_dir(cfg)
+    summary_path = out_dir / "simulation_summary.txt"
+    summary_path.write_text(summary)
+    print(f"Summary saved to {summary_path}")
 
 
 def main() -> None:
@@ -250,7 +342,7 @@ def main() -> None:
     parser.add_argument(
         "mode", nargs="?", default="train",
         choices=["train", "simulate"],
-        help="'train' to train adversaries, 'simulate' to run with trained weights (default: train)",
+        help="'train' to train adversaries, 'simulate' to run with trained weights",
     )
     args = parser.parse_args()
 

@@ -1,0 +1,19 @@
+
+============================================================
+TRAINING COMPLETE
+============================================================
+  World mode:     W1 (communication)
+  Episodes:       1000
+  Final epsilon:  0.0100
+
+  Last 10 episodes (mean):
+    Investor return: +2725
+    fair_1 (fair): +2075
+    max_1 (max): +913
+    rnd_1 (random): +2697
+
+  Last eval (ep 1000):
+    Mean wealth: 13955
+    fair_1: reward=+2219  repay=0.61
+    max_1: reward=+2071  repay=0.60
+    rnd_1: reward=+2986  repay=0.50

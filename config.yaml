@@ -26,7 +26,7 @@ behavioral_rnn:
 
 # --- World ---
 world:
-  communication: false            # false=W0 (others zeroed), true=W1 (others visible)
+  communication: true            # false=W0 (others zeroed), true=W1 (others visible)
   observation_depth: 4            # d: agent's own last d steps
 
 # --- Investor Q-learner (optional) ---

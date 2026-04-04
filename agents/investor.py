@@ -68,7 +68,8 @@ class RNNInvestor:
             self.ql_actions: list[int] = inv_cfg["actions"]
             k = len(agent_names)
             rnn_hidden_size = rnn_cfg["hidden_size"]
-            state_dim = rnn_hidden_size * k + 2 * k + 2
+            # state = [agent_one_hot(k) + all_hiddens(64*k) + prev_returns(k) + cum_returns(k) + wealth(1) + round(1)]
+            state_dim = k + rnn_hidden_size * k + 2 * k + 2
             action_dim = len(self.ql_actions)
             self.q_learner = QLearner(state_dim, action_dim, inv_cfg, device)
 
@@ -168,7 +169,7 @@ class RNNInvestor:
             return float(self.rnn_actions[action_idx])
 
         # --- Q-learner mode ---
-        state = self._build_ql_state(round_num, max_rounds)
+        state = self._build_ql_state(agent_name, round_num, max_rounds)
 
         if not self.eval_mode and self._prev_state is not None:
             self.q_learner.store_transition(
@@ -189,9 +190,17 @@ class RNNInvestor:
         return investment
 
     def _build_ql_state(
-        self, round_num: int, max_rounds: int,
+        self, agent_name: str, round_num: int, max_rounds: int,
     ) -> np.ndarray:
-        """Build cross-agent state vector for the Q-learner."""
+        """Build cross-agent state vector for the Q-learner.
+
+        Includes a one-hot encoding of which agent is being invested in,
+        so the Q-learner can learn different investment policies per agent.
+        """
+        # One-hot: which agent are we deciding for?
+        agent_onehot = np.zeros(len(self.agent_names), dtype=np.float32)
+        agent_onehot[self.agent_names.index(agent_name)] = 1.0
+
         all_hiddens = [
             self._hidden_cache[n].squeeze().cpu().numpy()
             for n in self.agent_names
@@ -206,7 +215,7 @@ class RNNInvestor:
         round_scaled = np.float32(round_num / max(max_rounds - 1, 1))
 
         return np.concatenate([
-            *all_hiddens, prev_rets, cum_rets,
+            agent_onehot, *all_hiddens, prev_rets, cum_rets,
             [wealth_scaled, round_scaled],
         ]).astype(np.float32)
 
@@ -227,7 +236,11 @@ class RNNInvestor:
         repayment: float,
         reward: float,
     ) -> None:
-        """Update tracking after a round resolves. Values are in simulation scale."""
+        """Update tracking after a round resolves. Values are in simulation scale.
+
+        When learning, the per-agent reward is set immediately so the Q-learner
+        can attribute profit/loss to the specific agent investment decision.
+        """
         trk = self._tracking[agent_name]
         inv_mult = investment * self.multiplier
         trk["prev_repay_prop"] = repayment / inv_mult if inv_mult > 0 else 0.0
@@ -239,16 +252,13 @@ class RNNInvestor:
             self._prev_returns[agent_name] = reward
             self._cumulative_returns[agent_name] += reward
             self._current_wealth += reward
+            # Per-agent reward: investor learns which agent is profitable
+            self._prev_reward = reward
 
     def receive_round_reward(self, total_round_reward: float) -> None:
-        """Called by game.py after all agents act in a round.
-
-        Sets the reward for the Q-learner's delayed transition storage.
-        The transition crossing the round boundary gets this reward;
-        within-round transitions get 0 (sparse-reward MDP).
-        """
-        if self.learns:
-            self._prev_reward = total_round_reward
+        """Legacy — kept for backward compatibility. Per-agent reward is now
+        set directly in observe_outcome()."""
+        pass
 
     def observe_done(self) -> None:
         """Called at episode end to store the terminal Q-learner transition."""

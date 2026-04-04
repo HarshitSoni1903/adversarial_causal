@@ -74,7 +74,10 @@ class Game:
         self.investor = investor
         self.agents = agents
         self.training_mode = training_mode
-        self.export_dir = Path(config["export"]["output_dir"])
+        # Output dir organized by world mode: outputs/w0/ or outputs/w1/
+        mode = "w1" if self.communication else "w0"
+        self.export_dir = Path(config["export"]["output_dir"]) / mode
+        self.export_dir.mkdir(parents=True, exist_ok=True)
         self.json_log_interval: int = config["export"].get("json_log_interval", 100)
 
     # ------------------------------------------------------------------

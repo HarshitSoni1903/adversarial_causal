@@ -102,9 +102,23 @@ class DQNAdversary(BaseAgent):
 
         Caches the reward for the delayed transition (stored in the next act()).
         On done=True, stores the terminal transition immediately.
+
+        MAX reward: current profit + scaled investment received.
+        The investment term incentivizes trust-building — if the agent repays
+        enough to keep the investor sending large amounts, it gets a bonus.
+        This encourages the strategy: build trust early, exploit later.
+        Formula: rl_reward = profit + 0.1 * investment_received
+        where profit = investment_multiplied - repayment (the agent's take)
+        and investment_received rewards attracting larger investments.
+
+        FAIR reward: 0 on all steps except terminal, where it's the negative
+        absolute gap between agent and investor cumulative earnings.
         """
         if self.policy == "max":
-            rl_reward = reward
+            # Profit from this step + bonus for attracting investment
+            profit = reward
+            invest_bonus = 0.1 * self._last_investment_received
+            rl_reward = profit + invest_bonus
         elif self.policy == "fair":
             self._episode_agent_total += reward
             if done:

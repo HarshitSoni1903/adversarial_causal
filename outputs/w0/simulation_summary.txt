@@ -1,0 +1,16 @@
+============================================================
+SIMULATION SUMMARY
+============================================================
+  World mode:            W0 (independent)
+  Total rounds:          10000
+  Final investor wealth: 32226.60
+  Investor cumulative:   22226.60
+
+  Agent        Policy     Cumulative  Mean Repay%
+  fair_1       fair        109730.40       63.8%
+  max_1        max          40205.25        1.3%
+  rnd_1        random       55599.75       50.3%
+
+  CSV columns: OK (16 expected)
+  rnn_hidden_state: valid JSON, length=64
+  observation_window: valid JSON, keys=['own', 'others']
