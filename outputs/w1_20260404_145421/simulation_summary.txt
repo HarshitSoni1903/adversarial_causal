@@ -1,6 +1,7 @@
 ============================================================
 SIMULATION SUMMARY
 ============================================================
+  Run ID:                w1_20260404_145421
   World mode:            W1 (communication)
   Total rounds:          802
   Final investor wealth: 0.83

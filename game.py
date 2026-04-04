@@ -57,6 +57,7 @@ class Game:
         investor: Any,
         agents: list[Any],
         training_mode: bool = True,
+        run_id: str | None = None,
     ) -> None:
         game_cfg = config["game"]
         self.max_rounds: int = game_cfg["max_rounds"]
@@ -74,10 +75,9 @@ class Game:
         self.investor = investor
         self.agents = agents
         self.training_mode = training_mode
-        # Output dir organized by world mode: outputs/w0/ or outputs/w1/
-        mode = "w1" if self.communication else "w0"
-        self.export_dir = Path(config["export"]["output_dir"]) / mode
-        self.export_dir.mkdir(parents=True, exist_ok=True)
+        # Output dir: outputs/<run_id>/ or outputs/<w0|w1>/
+        from utils import get_output_dir
+        self.export_dir = Path(get_output_dir(config, run_id))
         self.json_log_interval: int = config["export"].get("json_log_interval", 100)
 
     # ------------------------------------------------------------------

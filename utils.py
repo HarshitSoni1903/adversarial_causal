@@ -1,6 +1,7 @@
 """Shared utilities: config loading, seed management, checkpoint paths, and action encoding."""
 
 import random
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -14,14 +15,47 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def get_checkpoint_dir(config: dict) -> str:
-    """Return the world-mode-specific checkpoint directory, creating it if needed.
+def _world_mode_str(config: dict) -> str:
+    """Return 'w0' or 'w1' based on communication setting."""
+    return "w1" if config["world"]["communication"] else "w0"
 
-    Maps config["world"]["communication"] to w0/ or w1/ under the base dir.
+
+def create_run_id(config: dict) -> str:
+    """Create a unique run ID: w0_20260404_153022 or w1_20260404_153022.
+
+    Each run gets a timestamped folder so results are never overwritten.
+    """
+    mode = _world_mode_str(config)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{mode}_{timestamp}"
+
+
+def get_checkpoint_dir(config: dict, run_id: str | None = None) -> str:
+    """Return the run-specific checkpoint directory.
+
+    Structure: checkpoints/<run_id>/
+    If run_id is None, falls back to checkpoints/<w0|w1>/ for backward compat.
     """
     base = config["checkpoints"]["base_dir"]
-    mode = "w1" if config["world"]["communication"] else "w0"
-    path = Path(base) / mode
+    if run_id:
+        path = Path(base) / run_id
+    else:
+        path = Path(base) / _world_mode_str(config)
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def get_output_dir(config: dict, run_id: str | None = None) -> str:
+    """Return the run-specific output directory.
+
+    Structure: outputs/<run_id>/
+    If run_id is None, falls back to outputs/<w0|w1>/ for backward compat.
+    """
+    base = config["export"]["output_dir"]
+    if run_id:
+        path = Path(base) / run_id
+    else:
+        path = Path(base) / _world_mode_str(config)
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 

@@ -1,16 +1,21 @@
 """Entry point: wires together all components and runs the pipeline.
 
 Usage:
-    python main.py train      # Train adversaries online, save weights
-    python main.py simulate   # Load trained weights, run one game, export CSV
+    python main.py train                     # Train, auto-generates run ID
+    python main.py simulate --run w0_20260404_153022   # Simulate a specific run
+    python main.py simulate --run latest     # Simulate the most recent run
 
-Outputs are organized by world mode:
-    outputs/w0/   — communication=false results
-    outputs/w1/   — communication=true results
+Each run creates timestamped folders:
+    checkpoints/<run_id>/    — model weights
+    outputs/<run_id>/        — plots, CSVs, summaries
+    outputs/<run_id>/config.yaml  — snapshot of config used
+
+Run IDs follow the format: w0_YYYYMMDD_HHMMSS or w1_YYYYMMDD_HHMMSS
 """
 
 import argparse
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -19,24 +24,57 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import yaml
 
 from agents import create_all_agents
 from agents.investor import RNNInvestor
 from game import Game
-from utils import get_checkpoint_dir, load_config, set_all_seeds
+from utils import (
+    create_run_id,
+    get_checkpoint_dir,
+    get_output_dir,
+    load_config,
+    set_all_seeds,
+)
 from world import World
 
 
-def _get_output_dir(cfg: dict) -> Path:
-    """Return world-mode-specific output directory (outputs/w0/ or outputs/w1/)."""
-    base = Path(cfg["export"]["output_dir"])
-    mode = "w1" if cfg["world"]["communication"] else "w0"
-    out = base / mode
-    out.mkdir(parents=True, exist_ok=True)
-    return out
+# ------------------------------------------------------------------
+# Run management
+# ------------------------------------------------------------------
+
+def _find_latest_run(cfg: dict) -> str:
+    """Find the most recent run_id matching the current world mode."""
+    mode_prefix = "w1" if cfg["world"]["communication"] else "w0"
+    ckpt_base = Path(cfg["checkpoints"]["base_dir"])
+    if not ckpt_base.exists():
+        raise FileNotFoundError("No checkpoints directory found")
+
+    runs = sorted(
+        [d.name for d in ckpt_base.iterdir()
+         if d.is_dir() and d.name.startswith(mode_prefix + "_")],
+        reverse=True,
+    )
+    if not runs:
+        raise FileNotFoundError(
+            f"No runs found for {mode_prefix} in {ckpt_base}"
+        )
+    return runs[0]
 
 
-def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
+def _save_config_snapshot(cfg: dict, out_dir: Path) -> None:
+    """Save a copy of the config used for this run."""
+    with open(out_dir / "config.yaml", "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+
+
+# ------------------------------------------------------------------
+# Build components
+# ------------------------------------------------------------------
+
+def _build_components(
+    cfg: dict, run_id: str,
+) -> tuple[World, list, RNNInvestor, int]:
     """Build world, agents, investor, and compute state_dim."""
     agent_names = [a["name"] for a in cfg["agents"]]
 
@@ -52,10 +90,10 @@ def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
           f"(own={world.own_obs_dim()} + others={world.others_obs_dim()} "
           f"+ rnn_hidden={rnn_hidden_size} + round=1)")
 
-    agents = create_all_agents(cfg, state_dim)
+    agents = create_all_agents(cfg, state_dim, run_id=run_id)
     print(f"Agents: {[(a.name, a.policy) for a in agents]}")
 
-    investor = RNNInvestor(cfg, agent_names)
+    investor = RNNInvestor(cfg, agent_names, run_id=run_id)
     if investor.learns:
         k = len(agent_names)
         ql_state_dim = k + rnn_hidden_size * k + 2 * k + 2
@@ -65,6 +103,10 @@ def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
 
     return world, agents, investor, state_dim
 
+
+# ------------------------------------------------------------------
+# Training curves
+# ------------------------------------------------------------------
 
 def _save_training_curves(
     training_stats: dict, agents: list, save_dir: Path,
@@ -113,7 +155,7 @@ def _save_training_curves(
     plt.savefig(save_dir / "training_curves.png", dpi=150)
     plt.close(fig)
 
-    # --- Plot 2: Per-episode raw returns (with smoothed overlay) ---
+    # --- Plot 2: Per-episode raw returns ---
     fig2, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     ax = axes[0, 0]
@@ -139,7 +181,7 @@ def _save_training_curves(
     plt.savefig(save_dir / "per_episode_returns.png", dpi=150)
     plt.close(fig2)
 
-    # --- Plot 3: Repayment rates from eval snapshots ---
+    # --- Plot 3: Repayment rates from eval ---
     if eval_hist:
         fig3, ax3 = plt.subplots(figsize=(10, 5))
         eps = [e["episode"] for e in eval_hist]
@@ -161,10 +203,14 @@ def _save_training_curves(
     print(f"Training curves saved to {save_dir}/")
 
 
-def _export_csv(log_df: pd.DataFrame, cfg: dict) -> None:
-    """Export game log atomically to world-mode-specific output folder."""
-    out_dir = _get_output_dir(cfg)
-    out_path = out_dir / cfg["export"]["filename"]
+# ------------------------------------------------------------------
+# CSV export
+# ------------------------------------------------------------------
+
+def _export_csv(log_df: pd.DataFrame, out_dir: Path, filename: str) -> None:
+    """Export game log atomically."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
 
     with tempfile.NamedTemporaryFile(
         mode="w", dir=out_dir, suffix=".csv", delete=False,
@@ -175,7 +221,13 @@ def _export_csv(log_df: pd.DataFrame, cfg: dict) -> None:
     print(f"Game log saved to {out_path}  ({len(log_df)} rows)")
 
 
-def _build_summary(log_df: pd.DataFrame, agents: list, cfg: dict) -> str:
+# ------------------------------------------------------------------
+# Summaries
+# ------------------------------------------------------------------
+
+def _build_summary(
+    log_df: pd.DataFrame, agents: list, cfg: dict, run_id: str,
+) -> str:
     """Build simulation summary as a string."""
     if log_df.empty:
         return "No rounds played."
@@ -188,6 +240,7 @@ def _build_summary(log_df: pd.DataFrame, agents: list, cfg: dict) -> str:
     lines.append(f"{'='*60}")
     lines.append("SIMULATION SUMMARY")
     lines.append(f"{'='*60}")
+    lines.append(f"  Run ID:                {run_id}")
     lines.append(f"  World mode:            {mode}")
     lines.append(f"  Total rounds:          {total_rounds}")
     lines.append(f"  Final investor wealth: {final_wealth:.2f}")
@@ -225,7 +278,7 @@ def _build_summary(log_df: pd.DataFrame, agents: list, cfg: dict) -> str:
 
 
 def _build_training_summary(
-    stats: dict, agents: list, cfg: dict, game: Game,
+    stats: dict, agents: list, cfg: dict, game: Game, run_id: str,
 ) -> str:
     """Build training summary as a string."""
     lines = []
@@ -235,6 +288,7 @@ def _build_training_summary(
     lines.append(f"\n{'='*60}")
     lines.append("TRAINING COMPLETE")
     lines.append(f"{'='*60}")
+    lines.append(f"  Run ID:         {run_id}")
     lines.append(f"  World mode:     {mode}")
     lines.append(f"  Episodes:       {len(returns)}")
     lines.append(f"  Final epsilon:  {game._get_epsilon():.4f}")
@@ -264,11 +318,18 @@ def _build_training_summary(
 # ------------------------------------------------------------------
 
 def cmd_train(cfg: dict) -> None:
-    """Train adversaries online against frozen RNN investor."""
-    world, agents, investor, _ = _build_components(cfg)
+    """Train adversaries online. Creates a new run folder."""
+    run_id = create_run_id(cfg)
+    print(f"Run ID: {run_id}")
+
+    # Save config snapshot
+    out_dir = Path(get_output_dir(cfg, run_id))
+    _save_config_snapshot(cfg, out_dir)
+
+    world, agents, investor, _ = _build_components(cfg, run_id)
     dqn_cfg = cfg["dqn"]
 
-    game = Game(cfg, world, investor, agents, training_mode=True)
+    game = Game(cfg, world, investor, agents, training_mode=True, run_id=run_id)
     print(f"Game configured: endowment={cfg['game']['endowment']}, "
           f"max_rounds={cfg['game']['max_rounds']}, "
           f"multiplier={cfg['game']['multiplier']}")
@@ -285,20 +346,21 @@ def cmd_train(cfg: dict) -> None:
         eval_episodes=eval_episodes,
     )
 
-    out_dir = _get_output_dir(cfg)
     _save_training_curves(stats, agents, out_dir)
 
-    # Print and save training summary
-    summary = _build_training_summary(stats, agents, cfg, game)
+    # Print and save summary
+    summary = _build_training_summary(stats, agents, cfg, game, run_id)
     print(summary)
-    summary_path = out_dir / "training_summary.txt"
-    summary_path.write_text(summary)
-    print(f"Summary saved to {summary_path}")
+    (out_dir / "training_summary.txt").write_text(summary)
+    print(f"Summary saved to {out_dir / 'training_summary.txt'}")
+    print(f"\nRun saved: checkpoints/{run_id}/  and  outputs/{run_id}/")
 
 
-def cmd_simulate(cfg: dict) -> None:
-    """Load trained weights, run one game, export CSV."""
-    world, agents, investor, _ = _build_components(cfg)
+def cmd_simulate(cfg: dict, run_id: str) -> None:
+    """Load trained weights from a specific run, simulate, export CSV."""
+    print(f"Run ID: {run_id}")
+
+    world, agents, investor, _ = _build_components(cfg, run_id)
 
     for agent in agents:
         if hasattr(agent, "load"):
@@ -315,10 +377,10 @@ def cmd_simulate(cfg: dict) -> None:
             investor.load()
             print("Loaded investor Q-learner weights")
         except FileNotFoundError:
-            print("  WARNING: No investor checkpoint, using random Q-learner weights")
+            print("  WARNING: No investor checkpoint, using random weights")
         investor.set_eval_mode(True)
 
-    game = Game(cfg, world, investor, agents, training_mode=False)
+    game = Game(cfg, world, investor, agents, training_mode=False, run_id=run_id)
     print(f"Game configured: endowment={cfg['game']['endowment']}, "
           f"max_rounds={cfg['game']['max_rounds']}, "
           f"multiplier={cfg['game']['multiplier']}")
@@ -326,15 +388,14 @@ def cmd_simulate(cfg: dict) -> None:
     print("\nRunning simulation (eval mode)...")
     log_df = game.run()
 
-    _export_csv(log_df, cfg)
+    out_dir = Path(get_output_dir(cfg, run_id))
+    _export_csv(log_df, out_dir, cfg["export"]["filename"])
 
-    # Print and save simulation summary
-    summary = _build_summary(log_df, agents, cfg)
+    # Print and save summary
+    summary = _build_summary(log_df, agents, cfg, run_id)
     print(summary)
-    out_dir = _get_output_dir(cfg)
-    summary_path = out_dir / "simulation_summary.txt"
-    summary_path.write_text(summary)
-    print(f"Summary saved to {summary_path}")
+    (out_dir / "simulation_summary.txt").write_text(summary)
+    print(f"Summary saved to {out_dir / 'simulation_summary.txt'}")
 
 
 def main() -> None:
@@ -342,7 +403,12 @@ def main() -> None:
     parser.add_argument(
         "mode", nargs="?", default="train",
         choices=["train", "simulate"],
-        help="'train' to train adversaries, 'simulate' to run with trained weights",
+        help="'train' or 'simulate' (default: train)",
+    )
+    parser.add_argument(
+        "--run", type=str, default=None,
+        help="Run ID for simulate mode (e.g., w0_20260404_153022). "
+             "Use 'latest' for most recent run. Required for simulate.",
     )
     args = parser.parse_args()
 
@@ -351,8 +417,14 @@ def main() -> None:
 
     if args.mode == "train":
         cmd_train(cfg)
+
     elif args.mode == "simulate":
-        cmd_simulate(cfg)
+        if args.run is None or args.run == "latest":
+            run_id = _find_latest_run(cfg)
+            print(f"Using latest run: {run_id}")
+        else:
+            run_id = args.run
+        cmd_simulate(cfg, run_id)
 
 
 if __name__ == "__main__":

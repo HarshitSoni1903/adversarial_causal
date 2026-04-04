@@ -1,6 +1,7 @@
 ============================================================
 SIMULATION SUMMARY
 ============================================================
+  Run ID:                w0_20260404_145734
   World mode:            W0 (independent)
   Total rounds:          10000
   Final investor wealth: 243955.10

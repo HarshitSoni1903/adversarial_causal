@@ -42,9 +42,11 @@ class RNNInvestor:
         config: dict,
         agent_names: list[str],
         device: str = "cpu",
+        run_id: str | None = None,
     ) -> None:
         rnn_cfg = config["behavioral_rnn"]
         data_cfg = config["data"]
+        self._run_id = run_id
 
         self.model = load_behavioral_rnn(rnn_cfg["save_path"], device=device)
         self.device = device
@@ -292,12 +294,12 @@ class RNNInvestor:
         """Save Q-learner weights."""
         if self.learns:
             save_name = self.config["investor"]["save_name"]
-            path = path or f"{get_checkpoint_dir(self.config)}/{save_name}"
+            path = path or f"{get_checkpoint_dir(self.config, self._run_id)}/{save_name}"
             self.q_learner.save(path)
 
     def load(self, path: str | None = None) -> None:
         """Load Q-learner weights."""
         if self.learns:
             save_name = self.config["investor"]["save_name"]
-            path = path or f"{get_checkpoint_dir(self.config)}/{save_name}"
+            path = path or f"{get_checkpoint_dir(self.config, self._run_id)}/{save_name}"
             self.q_learner.load(path)

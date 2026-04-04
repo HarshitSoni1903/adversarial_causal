@@ -26,7 +26,7 @@ behavioral_rnn:
 
 # --- World ---
 world:
-  communication: true            # false=W0 (others zeroed), true=W1 (others visible)
+  communication: false            # false=W0 (others zeroed), true=W1 (others visible)
   observation_depth: 4            # d: agent's own last d steps
 
 # --- Investor Q-learner (optional) ---
@@ -60,7 +60,7 @@ agents:
 
   - name: "max_1"
     policy: "max"
-    repayment_actions: [0.0, 0.10, 0.25, 0.50, 0.75]     # can be stingy, max 75% return
+    repayment_actions: [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]     # can be stingy, max 50% return
 
   - name: "rnd_1"
     policy: "random"
@@ -73,16 +73,16 @@ dqn:
   hidden_layers: [128, 128]
   lr: 1.0e-3
   epsilon_start: 0.2
-  epsilon_decay: 0.995              # per-episode decay rate
+  epsilon_decay: 0.998              # per-episode decay rate
   epsilon_min: 0.01
   gamma: 0.95
   replay_buffer_size: 400000
   batch_size: 64
   target_update_freq: 1000
-  training_episodes: 1000          # number of full games for training
-  training_rounds: 100          # rounds per training episode
-  eval_interval: 200               # evaluate every N episodes
-  eval_episodes: 20                # games per evaluation
+  training_episodes: 3000          # number of full games for training
+  training_rounds: 50          # rounds per training episode
+  eval_interval: 300               # evaluate every N episodes
+  eval_episodes: 50                # games per evaluation
 # --- Checkpoints ---
 # Actual save dir is computed at runtime: checkpoints/w0/ or checkpoints/w1/
 # based on world.communication. behavioral_rnn.pt is shared (top-level).

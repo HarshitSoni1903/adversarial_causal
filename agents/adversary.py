@@ -40,9 +40,11 @@ class DQNAdversary(BaseAgent):
         full_config: dict,
         state_dim: int,
         num_actions: int,
+        run_id: str | None = None,
     ) -> None:
         super().__init__(name, policy, full_config)
         dqn_cfg = full_config["dqn"]
+        self._run_id = run_id
 
         self.repayment_actions: list[float] = agent_cfg.get(
             "repayment_actions", dqn_cfg.get(
@@ -103,25 +105,25 @@ class DQNAdversary(BaseAgent):
         Caches the reward for the delayed transition (stored in the next act()).
         On done=True, stores the terminal transition immediately.
 
-        MAX reward: current profit + scaled investment received.
-        The investment term incentivizes trust-building — if the agent repays
-        enough to keep the investor sending large amounts, it gets a bonus.
-        This encourages the strategy: build trust early, exploit later.
-        Formula: rl_reward = profit + 0.1 * investment_received
-        where profit = investment_multiplied - repayment (the agent's take)
-        and investment_received rewards attracting larger investments.
+        MAX reward (Dezfouli original):
+        Pure profit per step: rl_reward = investment_multiplied - repayment.
+        Trust-building emerges naturally from the discount factor — repaying
+        more now leads to larger investments later, which means larger future
+        profits. The Q-learner discovers this through temporal credit assignment
+        without needing an artificial trust bonus.
 
-        FAIR reward: 0 on all steps except terminal, where it's the negative
-        absolute gap between agent and investor cumulative earnings.
+        FAIR reward (bilateral):
+        0 on all steps except terminal, where it's the negative absolute gap
+        between THIS agent's total earnings and the investor's earnings FROM
+        THIS AGENT ONLY (repayment - investment, summed). Each agent's fairness
+        is evaluated on its own bilateral relationship with the investor.
         """
         if self.policy == "max":
-            # Profit from this step + bonus for attracting investment
-            profit = reward
-            invest_bonus = 0.1 * self._last_investment_received
-            rl_reward = profit + invest_bonus
+            rl_reward = reward  # pure profit: investment_multiplied - repayment
         elif self.policy == "fair":
             self._episode_agent_total += reward
             if done:
+                # Bilateral gap: agent's earnings vs investor's earnings from THIS agent only
                 rl_reward = -abs(self._episode_agent_total - self._episode_investor_total)
             else:
                 rl_reward = 0.0
@@ -144,7 +146,11 @@ class DQNAdversary(BaseAgent):
             self._prev_reward = rl_reward
 
     def set_investor_reward(self, investor_reward: float) -> None:
-        """Called by game.py after each step so FAIR can track investor earnings."""
+        """Called by game.py after each step with the investor's reward FROM THIS AGENT.
+
+        investor_reward = repayment - investment (bilateral, not total).
+        Used by FAIR to compute the bilateral earnings gap at episode end.
+        """
         self._episode_investor_total += investor_reward
 
     def set_investment_received(self, investment_multiplied: float) -> None:
@@ -168,9 +174,9 @@ class DQNAdversary(BaseAgent):
         self._update_counter = 0
 
     def save(self, path: str | None = None) -> None:
-        path = path or f"{get_checkpoint_dir(self.config)}/{self.name}.pt"
+        path = path or f"{get_checkpoint_dir(self.config, self._run_id)}/{self.name}.pt"
         self.q_learner.save(path)
 
     def load(self, path: str | None = None) -> None:
-        path = path or f"{get_checkpoint_dir(self.config)}/{self.name}.pt"
+        path = path or f"{get_checkpoint_dir(self.config, self._run_id)}/{self.name}.pt"
         self.q_learner.load(path)
