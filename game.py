@@ -24,12 +24,15 @@ from world import World
 
 
 class InvestorProtocol(Protocol):
-    def act(self, agent_name: str) -> float: ...
+    learns: bool
+    def act(self, agent_name: str, *, round_num: int = 0, max_rounds: int = 1) -> float: ...
     def get_hidden_state(self, agent_name: str) -> np.ndarray: ...
     def observe_outcome(
         self, agent_name: str, investment: float,
         repayment: float, reward: float,
     ) -> None: ...
+    def receive_round_reward(self, total_round_reward: float) -> None: ...
+    def observe_done(self) -> None: ...
     def reset(self) -> None: ...
 
 
@@ -113,9 +116,12 @@ class Game:
             if investor_wealth < self.min_investment:
                 break
             total_rounds = t + 1
+            round_investor_reward = 0.0
 
             for agent in self.agents:
-                investment = self.investor.act(agent.name)
+                investment = self.investor.act(
+                    agent.name, round_num=t, max_rounds=n_rounds,
+                )
                 investment = max(self.min_investment, min(investment, investor_wealth))
 
                 if investor_wealth < self.min_investment:
@@ -144,6 +150,7 @@ class Game:
 
                 investor_wealth += investor_reward
                 investor_cumulative += investor_reward
+                round_investor_reward += investor_reward
                 agent.cumulative_reward += agent_reward
 
                 self.world.record_step(agent.name, investment, repayment)
@@ -187,11 +194,14 @@ class Game:
                         "observation_window": obs_json,
                     })
 
+            self.investor.receive_round_reward(round_investor_reward)
+
             if investor_wealth < self.min_investment:
                 break
 
         for agent in self.agents:
             agent.observe(0.0, done=True)
+        self.investor.observe_done()
 
         result: dict[str, Any] = {
             "total_rounds": total_rounds,
@@ -230,8 +240,8 @@ class Game:
     ) -> dict:
         """Run multiple episodes for online adversary training.
 
-        Returns dict with training_returns (list of per-episode agent rewards)
-        and eval_history (list of eval snapshots).
+        Returns dict with training_returns (list of per-episode dicts with
+        investor_return and per-agent returns) and eval_history.
         """
         training_returns: list[dict] = []
         eval_history: list[dict] = []
@@ -239,21 +249,27 @@ class Game:
         pbar = tqdm(range(1, num_episodes + 1), desc="Training", unit="ep")
         for ep in pbar:
             stats = self._run_episode(log_details=False, rounds_override=self.training_rounds)
-            training_returns.append(stats["agent_rewards"])
+            ep_returns = {
+                "investor_return": stats["investor_cumulative"],
+                **stats["agent_rewards"],
+            }
+            training_returns.append(ep_returns)
 
             for agent in self.agents:
                 if hasattr(agent, "q_learner"):
                     agent.q_learner.decay_epsilon()
+            self.investor.decay_epsilon()
 
             eps_val = self._get_epsilon()
             if ep % 10 == 0 or ep == 1:
+                inv_ret = stats["investor_cumulative"]
                 postfix: dict[str, str] = {
-                    "w": f"{stats['final_wealth']:.0f}",
-                    "eps": f"{eps_val:.3f}",
+                    "inv_ret": f"{'+' if inv_ret >= 0 else ''}{inv_ret:.0f}",
                 }
                 for a in self.agents:
                     r = stats["agent_rewards"][a.name]
                     postfix[a.name] = f"{'+' if r >= 0 else ''}{r:.0f}"
+                postfix["eps"] = f"{eps_val:.3f}"
                 pbar.set_postfix(postfix)
 
             if ep % eval_interval == 0:
@@ -276,10 +292,38 @@ class Game:
                 agent.save()
                 print(f"Saved {agent.name} weights")
 
+        self.investor.save()
+        if self.investor.learns:
+            print("Saved investor Q-learner weights")
+
+        self._save_training_returns_csv(training_returns)
+
         return {"training_returns": training_returns, "eval_history": eval_history}
+
+    def _save_training_returns_csv(self, training_returns: list[dict]) -> None:
+        """Save per-episode returns CSV for downstream analysis in R."""
+        if not training_returns:
+            return
+
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+        agent_names = [a.name for a in self.agents]
+
+        rows: list[dict] = []
+        for ep_idx, ret in enumerate(training_returns, start=1):
+            row: dict[str, float | int] = {"episode": ep_idx}
+            row["investor_return"] = round(ret["investor_return"], 2)
+            for name in agent_names:
+                row[f"{name}_return"] = round(ret[name], 2)
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        out_path = self.export_dir / "training_returns.csv"
+        df.to_csv(out_path, index=False)
+        print(f"Training returns saved to {out_path}  ({len(df)} rows)")
 
     def _run_eval(self, num_episodes: int) -> dict:
         """Run evaluation episodes with agents in eval mode."""
+        self.investor.set_eval_mode(True)
         for agent in self.agents:
             if hasattr(agent, "set_eval_mode"):
                 agent.set_eval_mode(True)
@@ -294,6 +338,7 @@ class Game:
             agent_rewards_list.append(stats["agent_rewards"])
             agent_repay_list.append(stats["agent_repay_means"])
 
+        self.investor.set_eval_mode(False)
         for agent in self.agents:
             if hasattr(agent, "set_eval_mode"):
                 agent.set_eval_mode(False)
@@ -311,7 +356,9 @@ class Game:
         }
 
     def _get_epsilon(self) -> float:
-        """Get current epsilon from the first DQN agent, or 0 if none."""
+        """Get current epsilon from the first DQN agent or investor Q-learner."""
+        if self.investor.learns:
+            return self.investor.q_learner.epsilon
         for agent in self.agents:
             if hasattr(agent, "q_learner"):
                 return agent.q_learner.epsilon

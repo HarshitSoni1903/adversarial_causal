@@ -43,7 +43,12 @@ def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
     print(f"Agents: {[(a.name, a.policy) for a in agents]}")
 
     investor = RNNInvestor(cfg, agent_names)
-    print("Investor loaded (frozen BehavioralRNN)")
+    if investor.learns:
+        k = len(agent_names)
+        ql_state_dim = rnn_hidden_size * k + 2 * k + 2
+        print(f"Investor loaded (frozen RNN + Q-learner, state_dim={ql_state_dim})")
+    else:
+        print("Investor loaded (frozen BehavioralRNN)")
 
     return world, agents, investor, state_dim
 
@@ -51,7 +56,7 @@ def _build_components(cfg: dict) -> tuple[World, list, RNNInvestor, int]:
 def _save_training_curves(
     training_stats: dict, agents: list, save_dir: Path,
 ) -> None:
-    """Save per-agent training return curves."""
+    """Save per-participant training return curves (investor + agents)."""
     returns = training_stats["training_returns"]
     if not returns:
         return
@@ -60,6 +65,11 @@ def _save_training_curves(
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     window = max(1, len(returns) // 50)
+
+    inv_vals = [r["investor_return"] for r in returns]
+    inv_smooth = np.convolve(inv_vals, np.ones(window) / window, mode="valid")
+    ax1.plot(inv_smooth, label="investor", color="black", linewidth=1.5)
+
     for agent in agents:
         vals = [r[agent.name] for r in returns]
         smoothed = np.convolve(vals, np.ones(window) / window, mode="valid")
@@ -177,6 +187,28 @@ def cmd_train(cfg: dict) -> None:
 
     out_dir = Path(cfg["export"]["output_dir"])
     _save_training_curves(stats, agents, out_dir)
+    # Print final training summary
+    print(f"\n{'='*50}")
+    print("TRAINING COMPLETE")
+    print(f"{'='*50}")
+    returns = stats["training_returns"]
+    last_10 = returns[-10:] if len(returns) >= 10 else returns
+    print(f"  Episodes: {len(returns)}")
+    print(f"  Final epsilon: {game._get_epsilon():.4f}")
+    print(f"\n  Last 10 episodes (mean):")
+    print(f"    Investor return: {np.mean([r['investor_return'] for r in last_10]):+.0f}")
+    for agent in agents:
+        mean_r = np.mean([r[agent.name] for r in last_10])
+        print(f"    {agent.name} ({agent.policy}): {mean_r:+.0f}")
+
+    if stats["eval_history"]:
+        last_eval = stats["eval_history"][-1]
+        print(f"\n  Last eval (ep {last_eval['episode']}):")
+        print(f"    Mean wealth: {last_eval['mean_wealth']:.0f}")
+        for agent in agents:
+            r = last_eval['mean_agent_rewards'][agent.name]
+            rp = last_eval['mean_agent_repay'][agent.name]
+            print(f"    {agent.name}: reward={r:+.0f}  repay={rp:.2f}")
 
 
 def cmd_simulate(cfg: dict) -> None:
@@ -192,6 +224,14 @@ def cmd_simulate(cfg: dict) -> None:
                 print(f"  WARNING: No checkpoint for {agent.name}, using random weights")
         if hasattr(agent, "set_eval_mode"):
             agent.set_eval_mode(True)
+
+    if investor.learns:
+        try:
+            investor.load()
+            print("Loaded investor Q-learner weights")
+        except FileNotFoundError:
+            print("  WARNING: No investor checkpoint, using random Q-learner weights")
+        investor.set_eval_mode(True)
 
     game = Game(cfg, world, investor, agents, training_mode=False)
     print(f"Game configured: endowment={cfg['game']['endowment']}, "

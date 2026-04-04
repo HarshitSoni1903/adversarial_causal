@@ -29,6 +29,21 @@ world:
   communication: false            # false=W0 (others zeroed), true=W1 (others visible)
   observation_depth: 4            # d: agent's own last d steps
 
+# --- Investor Q-learner (optional) ---
+investor:
+  learns: true                     # true = Q-learner on top of frozen RNN
+  actions: [0, 5, 10, 15, 20]      # same as RNN training buckets
+  lr: 1.0e-3
+  epsilon_start: 0.2
+  epsilon_decay: 0.995               # per-episode decay
+  epsilon_min: 0.01
+  gamma: 0.95
+  replay_buffer_size: 200000
+  batch_size: 64
+  hidden_layers: [128, 128]
+  target_update_freq: 1000
+  save_name: "investor_ql.pt"          # saved under checkpoints/<w0|w1>/
+
 # --- Phase 4: Game simulation ---
 game:
   max_rounds: 10000
@@ -56,19 +71,23 @@ agents:
 dqn:
   repayment_actions: [0.0, 0.25, 0.50, 0.75, 1.0]  # default action space
   hidden_layers: [128, 128]
-  lr: 1.0e-4
+  lr: 1.0e-3
   epsilon_start: 0.2
-  epsilon_decay: 0.99              # per-episode decay rate
+  epsilon_decay: 0.995              # per-episode decay rate
   epsilon_min: 0.01
-  gamma: 0.99
+  gamma: 0.95
   replay_buffer_size: 400000
   batch_size: 64
   target_update_freq: 1000
-  training_episodes: 100          # number of full games for training
-  training_rounds: 10000          # rounds per training episode
-  eval_interval: 10               # evaluate every N episodes
-  eval_episodes: 5                # games per evaluation
-  save_dir: "checkpoints/"
+  training_episodes: 1000          # number of full games for training
+  training_rounds: 100          # rounds per training episode
+  eval_interval: 200               # evaluate every N episodes
+  eval_episodes: 20                # games per evaluation
+# --- Checkpoints ---
+# Actual save dir is computed at runtime: checkpoints/w0/ or checkpoints/w1/
+# based on world.communication. behavioral_rnn.pt is shared (top-level).
+checkpoints:
+  base_dir: "checkpoints"
 
 # --- CSV Export ---
 export:

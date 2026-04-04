@@ -27,6 +27,7 @@ import numpy as np
 
 from agents.base import BaseAgent
 from models.q_learner import QLearner
+from utils import get_checkpoint_dir
 
 
 class DQNAdversary(BaseAgent):
@@ -59,6 +60,7 @@ class DQNAdversary(BaseAgent):
         self._episode_agent_total = 0.0
         self._episode_investor_total = 0.0
         self._last_investment_received = 0.0
+        self._update_counter: int = 0
 
     def act(
         self,
@@ -82,7 +84,9 @@ class DQNAdversary(BaseAgent):
                 self._prev_state, self._prev_action, self._prev_reward,
                 state, False,
             )
-            self.q_learner.update()
+            if self._update_counter % 10 == 0:
+                self.q_learner.update()
+            self._update_counter += 1
 
         action_idx = self.q_learner.select_action(state, greedy=self.eval_mode)
 
@@ -117,7 +121,9 @@ class DQNAdversary(BaseAgent):
                     self._prev_state, self._prev_action, rl_reward,
                     terminal_state, True,
                 )
-                self.q_learner.update()
+                if self._update_counter % 10 == 0:
+                    self.q_learner.update()
+                self._update_counter += 1
             self._prev_state = None
             self._prev_action = None
         else:
@@ -145,11 +151,12 @@ class DQNAdversary(BaseAgent):
         self._episode_agent_total = 0.0
         self._episode_investor_total = 0.0
         self._last_investment_received = 0.0
+        self._update_counter = 0
 
     def save(self, path: str | None = None) -> None:
-        path = path or f"{self.config['dqn']['save_dir']}{self.name}.pt"
+        path = path or f"{get_checkpoint_dir(self.config)}/{self.name}.pt"
         self.q_learner.save(path)
 
     def load(self, path: str | None = None) -> None:
-        path = path or f"{self.config['dqn']['save_dir']}{self.name}.pt"
+        path = path or f"{get_checkpoint_dir(self.config)}/{self.name}.pt"
         self.q_learner.load(path)
