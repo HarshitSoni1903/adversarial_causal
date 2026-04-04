@@ -77,6 +77,7 @@ class RNNInvestor:
 
             self._initial_endowment: float = float(config["game"]["endowment"])
             self._current_wealth: float = self._initial_endowment
+            self._training_rounds: int = config["dqn"].get("training_rounds", 50)
 
             self._prev_returns: dict[str, float] = {}
             self._cumulative_returns: dict[str, float] = {}
@@ -198,6 +199,12 @@ class RNNInvestor:
 
         Includes a one-hot encoding of which agent is being invested in,
         so the Q-learner can learn different investment policies per agent.
+
+        IMPORTANT: round_scaled and wealth_scaled are normalized using
+        training-regime values (training_rounds, initial_endowment) so
+        the Q-network sees the same input distribution during simulation
+        as during training. Without this, the Q-network gets alien inputs
+        during 10k-round simulation and can't generalize.
         """
         # One-hot: which agent are we deciding for?
         agent_onehot = np.zeros(len(self.agent_names), dtype=np.float32)
@@ -210,11 +217,21 @@ class RNNInvestor:
         prev_rets = np.array(
             [self._prev_returns[n] for n in self.agent_names], dtype=np.float32,
         )
-        cum_rets = np.array(
+        # Normalize cumulative returns to training scale
+        # During training (50 rounds), cum_rets is ~0-2000. During simulation
+        # (10k rounds), it can be 0-600k. Divide by initial endowment to keep
+        # it in a reasonable range the Q-network was trained on.
+        raw_cum = np.array(
             [self._cumulative_returns[n] for n in self.agent_names], dtype=np.float32,
         )
-        wealth_scaled = np.float32(self._current_wealth / self._initial_endowment)
-        round_scaled = np.float32(round_num / max(max_rounds - 1, 1))
+        cum_rets = raw_cum / self._initial_endowment
+        # Normalize using training regime, not simulation regime
+        wealth_scaled = np.float32(
+            np.clip(self._current_wealth / self._initial_endowment, 0.0, 10.0)
+        )
+        round_scaled = np.float32(
+            min(round_num / max(self._training_rounds - 1, 1), 1.0)
+        )
 
         return np.concatenate([
             agent_onehot, *all_hiddens, prev_rets, cum_rets,

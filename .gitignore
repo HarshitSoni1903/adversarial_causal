@@ -3,3 +3,6 @@ __pycache__/
 .cursorrules
 .vscode/
 .DS_Store
+
+outputs/
+checkpoints/

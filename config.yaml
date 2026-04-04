@@ -24,9 +24,16 @@ behavioral_rnn:
   use_class_weights: True
   save_path: "checkpoints/behavioral_rnn.pt"
 
+# --- Live simulation (online learning during full game) ---
+live_simulation:
+  enabled: true
+  rounds: 10000               # full length game with learning
+  use_pretrained: true         # true=start from trained weights, false=fresh agents
+  epsilon: 0.1                 # exploration rate during live sim
+
 # --- World ---
 world:
-  communication: false            # false=W0 (others zeroed), true=W1 (others visible)
+  communication: true            # false=W0 (others zeroed), true=W1 (others visible)
   observation_depth: 4            # d: agent's own last d steps
 
 # --- Investor Q-learner (optional) ---
@@ -49,7 +56,7 @@ game:
   max_rounds: 10000
   endowment: 10000                # investor total starting wealth
   multiplier: 3                   # funds sent are tripled
-  min_investment: 1               # investor must send >= 1 per step
+  min_investment: 0               # investor must send >= 1 per step
 
 # Each entry defines one adversary agent. Add or remove freely.
 # Per-agent params override global dqn defaults.
