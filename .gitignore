@@ -4,5 +4,4 @@ __pycache__/
 .vscode/
 .DS_Store
 
-outputs/
-checkpoints/
+old_ckpt_outputs/

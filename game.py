@@ -256,6 +256,9 @@ class Game:
                 "investor_return": stats["investor_cumulative"],
                 **stats["agent_rewards"],
             }
+            # Track per-episode repayment % for each agent
+            for aname, rpct in stats["agent_repay_means"].items():
+                ep_returns[f"{aname}_repay"] = rpct
             training_returns.append(ep_returns)
 
             for agent in self.agents:
@@ -317,6 +320,9 @@ class Game:
             row["investor_return"] = round(ret["investor_return"], 2)
             for name in agent_names:
                 row[f"{name}_return"] = round(ret[name], 2)
+                repay_key = f"{name}_repay"
+                if repay_key in ret:
+                    row[repay_key] = round(ret[repay_key], 4)
             rows.append(row)
 
         df = pd.DataFrame(rows)

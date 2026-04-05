@@ -1,0 +1,13 @@
+
+============================================================
+LIVE SIMULATION
+============================================================
+  Run ID:          w1_20260404_211937
+  World mode:      W1 (communication)
+  Total rounds:    10000
+  Final wealth:    133749.50
+  Investor cumul:  123749.50
+
+  Agent        Policy     Cumulative  Mean Repay%
+  fair_1       fair         84432.00       73.6%
+  max_1        max          93778.50       27.8%

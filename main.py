@@ -132,16 +132,31 @@ def _save_curves(stats: dict, agents: list, save_dir: Path) -> None:
         ax.set(title=f"{a.name} ({a.policy})", xlabel="Episode", ylabel="Return")
     plt.tight_layout(); plt.savefig(save_dir/"per_episode_returns.png", dpi=150); plt.close(fig2)
 
-    # Plot 3: repayment rates
+    # Plot 3: repayment rates from eval
     if eh:
         fig3, ax3 = plt.subplots(figsize=(10, 5))
         eps = [e["episode"] for e in eh]
         for a in agents:
             ax3.plot(eps, [e["mean_agent_repay"][a.name] for e in eh],
                      label=f"{a.name} ({a.policy})", marker="o", ms=3)
-        ax3.set(xlabel="Episode", ylabel="Mean Repayment %", title="Repayment Rates", ylim=(-0.05,1.05))
+        ax3.set(xlabel="Episode", ylabel="Mean Repayment %", title="Eval Repayment Rates", ylim=(-0.05,1.05))
         ax3.legend(); plt.tight_layout()
         plt.savefig(save_dir/"repayment_rates.png", dpi=150); plt.close(fig3)
+
+    # Plot 4: per-episode repayment % during training (smoothed)
+    repay_keys = [f"{a.name}_repay" for a in agents]
+    if returns and repay_keys[0] in returns[0]:
+        fig4, ax4 = plt.subplots(figsize=(10, 5))
+        for a in agents:
+            key = f"{a.name}_repay"
+            vals = [r[key] for r in returns]
+            smoothed = np.convolve(vals, np.ones(window)/window, mode="valid")
+            ax4.plot(vals, alpha=0.15, lw=0.5)
+            ax4.plot(smoothed, label=f"{a.name} ({a.policy})", lw=1.5)
+        ax4.set(xlabel="Episode", ylabel="Mean Repayment %",
+                title="Training Repayment % per Episode", ylim=(-0.05, 1.05))
+        ax4.legend(); plt.tight_layout()
+        plt.savefig(save_dir/"training_repayment.png", dpi=150); plt.close(fig4)
 
 
 def _print_investor_qvals(investor):
@@ -153,10 +168,76 @@ def _print_investor_qvals(investor):
         with torch.no_grad():
             q = investor.q_learner.policy_net(
                 torch.tensor(state, dtype=torch.float32).unsqueeze(0))
-        actions = investor.ql_actions
-        best = q.argmax(1).item()
-        vals = "  ".join(f"inv_{actions[j]}={'>' if j==best else ' '}{q[0,j]:.1f}" for j in range(len(actions)))
-        print(f"    {name}: {vals}")
+
+
+def _save_round_analysis(log_df: pd.DataFrame, agents: list, save_dir: Path,
+                         label: str = "") -> None:
+    """Analyze and plot per-round repayment, investment, and reward patterns.
+
+    This is the key chart for seeing trust-then-exploit strategies (Dezfouli Fig 5D).
+    """
+    if log_df.empty:
+        return
+    save_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{label}_" if label else ""
+    n_rounds = log_df["timestep"].max() + 1
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Plot 1: Repayment % by round (per agent)
+    ax = axes[0, 0]
+    for a in agents:
+        rows = log_df[log_df["agent_name"] == a.name]
+        by_round = rows.groupby("timestep")["repayment_pct"].mean()
+        ax.plot(by_round.index, by_round.values,
+                label=f"{a.name} ({a.policy})", marker="o", ms=3)
+    ax.set(xlabel="Round", ylabel="Repayment %", title="Repayment by Round")
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend()
+
+    # Plot 2: Investment by round (per agent)
+    ax = axes[0, 1]
+    for a in agents:
+        rows = log_df[log_df["agent_name"] == a.name]
+        by_round = rows.groupby("timestep")["investment"].mean()
+        ax.plot(by_round.index, by_round.values,
+                label=f"{a.name} ({a.policy})", marker="o", ms=3)
+    ax.set(xlabel="Round", ylabel="Investment", title="Investment by Round")
+    ax.legend()
+
+    # Plot 3: Investor reward by round (per agent)
+    ax = axes[1, 0]
+    for a in agents:
+        rows = log_df[log_df["agent_name"] == a.name]
+        by_round = rows.groupby("timestep")["investor_reward"].mean()
+        ax.plot(by_round.index, by_round.values,
+                label=f"{a.name} ({a.policy})", marker="o", ms=3)
+    ax.axhline(y=0, color="gray", ls="--", alpha=0.5)
+    ax.set(xlabel="Round", ylabel="Investor Reward", title="Investor Reward by Round")
+    ax.legend()
+
+    # Plot 4: Agent reward by round (per agent)
+    ax = axes[1, 1]
+    for a in agents:
+        rows = log_df[log_df["agent_name"] == a.name]
+        by_round = rows.groupby("timestep")["agent_reward"].mean()
+        ax.plot(by_round.index, by_round.values,
+                label=f"{a.name} ({a.policy})", marker="o", ms=3)
+    ax.set(xlabel="Round", ylabel="Agent Reward", title="Agent Reward by Round")
+    ax.legend()
+
+    plt.suptitle(f"Per-Round Analysis{' (' + label + ')' if label else ''}", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(save_dir / f"{prefix}round_analysis.png", dpi=150)
+    plt.close(fig)
+
+    # Print per-round table
+    # print(f"\n  Per-round repayment pattern{' (' + label + ')' if label else ''}:")
+    # for a in agents:
+    #     rows = log_df[log_df["agent_name"] == a.name]
+    #     by_round = rows.groupby("timestep")["repayment_pct"].mean()
+    #     vals = "  ".join(f"R{r}={v:.0%}" for r, v in by_round.items())
+    #     print(f"    {a.name}: {vals}")
 
 
 # ------------------------------------------------------------------
@@ -189,13 +270,13 @@ def _training_summary(stats, agents, cfg, game, run_id) -> str:
     return "\n".join(lines)
 
 
-def _simulation_summary(log_df, agents, cfg, run_id) -> str:
+def _simulation_summary(log_df, agents, cfg, run_id, label="SIMULATION SUMMARY") -> str:
     if log_df.empty:
         return "No rounds played."
     lines = []
     mode = "W1 (communication)" if cfg["world"]["communication"] else "W0 (independent)"
     lines.append(f"\n{'='*60}")
-    lines.append("SIMULATION SUMMARY")
+    lines.append(label)
     lines.append(f"{'='*60}")
     lines.append(f"  Run ID:          {run_id}")
     lines.append(f"  World mode:      {mode}")
@@ -210,6 +291,30 @@ def _simulation_summary(log_df, agents, cfg, run_id) -> str:
         repay = rows["repayment_pct"].mean() if not rows.empty else 0.0
         lines.append(f"  {a.name:<12} {a.policy:<8} {cumul:>12.2f} {repay:>11.1%}")
     return "\n".join(lines)
+
+
+def _save_live_plot(log_df: pd.DataFrame, agents: list, save_dir: Path) -> None:
+    """Save investor wealth and agent cumulative reward plots for live simulation."""
+    if log_df.empty:
+        return
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    first_agent = agents[0].name
+    wealth = log_df[log_df["agent_name"] == first_agent]
+    ax1.plot(wealth["timestep"], wealth["investor_wealth"], color="black", lw=1.5)
+    ax1.axhline(y=10000, color="gray", ls="--", alpha=0.5)
+    ax1.set(xlabel="Round", ylabel="Wealth", title="Live Sim: Investor Wealth")
+
+    for a in agents:
+        rows = log_df[log_df["agent_name"] == a.name]
+        ax2.plot(rows["timestep"], rows["agent_cumulative"],
+                 label=f"{a.name} ({a.policy})")
+    ax2.set(xlabel="Round", ylabel="Cumulative Reward", title="Live Sim: Agent Rewards")
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_dir / "live_simulation.png", dpi=150)
+    plt.close(fig)
 
 
 # ------------------------------------------------------------------
@@ -287,9 +392,76 @@ def run_pipeline(cfg: dict) -> None:
     _print_investor_qvals(investor)
 
     # Summary from CSV data (not stale agent objects)
-    sim_summary = _simulation_summary(log_df, agents, cfg, run_id)
+    sim_summary = _simulation_summary(log_df, agents, cfg, run_id, label="EVAL SIMULATION")
     print(sim_summary)
-    (out / "simulation_summary.txt").write_text(sim_summary)
+    (out / "eval_simulation_summary.txt").write_text(sim_summary)
+
+    # Per-round analysis (trust-then-exploit pattern)
+    _save_round_analysis(log_df, agents, out, label="eval")
+
+    # --- Phase 3: LIVE SIMULATION (online learning, 10k rounds) ---
+    live_cfg = cfg.get("live_simulation", {})
+    if live_cfg.get("enabled", True):
+        live_rounds = live_cfg.get("rounds", cfg["game"]["max_rounds"])
+        use_pretrained = live_cfg.get("use_pretrained", True)
+        print(f"\n--- LIVE SIMULATION ({live_rounds} rounds, online learning, "
+              f"pretrained={'yes' if use_pretrained else 'no'}) ---")
+
+        # Reset everything
+        world.reset()
+        investor.reset()
+        for a in agents:
+            a.reset()
+
+        if not use_pretrained:
+            # Fresh Q-learners — reinitialize from config
+            world2, agents2, investor2 = _build(cfg, run_id)
+            agents = agents2
+            investor = investor2
+            print("  Fresh agents (no pre-training)")
+        else:
+            # Keep trained weights, reset episode state, enable learning
+            print("  Starting from trained weights, continuing to learn")
+
+        # Enable learning mode
+        investor.set_eval_mode(False)
+        for a in agents:
+            if hasattr(a, "set_eval_mode"):
+                a.set_eval_mode(False)
+
+        # Reset epsilon for exploration during live sim
+        live_epsilon = live_cfg.get("epsilon", 0.1)
+        if investor.learns and investor.q_learner:
+            investor.q_learner.epsilon = live_epsilon
+        for a in agents:
+            if hasattr(a, "q_learner"):
+                a.q_learner.epsilon = live_epsilon
+
+        # Run one long episode with learning enabled and full logging
+        game_live = Game(cfg, world, investor, agents, training_mode=True, run_id=run_id)
+        # Override max_rounds for this run
+        live_result = game_live._run_episode(
+            log_details=True, rounds_override=live_rounds,
+        )
+        live_df = live_result["log_df"]
+
+        # Export live CSV
+        live_csv = out / "live_game_log.csv"
+        with tempfile.NamedTemporaryFile(mode="w", dir=out, suffix=".csv", delete=False) as tmp:
+            live_df.to_csv(tmp, index=False)
+            Path(tmp.name).rename(live_csv)
+        print(f"Live game log: {live_csv} ({len(live_df)} rows)")
+
+        # Save live simulation plot
+        _save_live_plot(live_df, agents, out)
+
+        # Summary
+        live_summary = _simulation_summary(live_df, agents, cfg, run_id, label="LIVE SIMULATION")
+        print(live_summary)
+        (out / "live_simulation_summary.txt").write_text(live_summary)
+
+        # Per-round analysis for live sim
+        _save_round_analysis(live_df, agents, out, label="live")
 
     print(f"\n{'='*60}")
     print(f"All outputs in: {out}/")
