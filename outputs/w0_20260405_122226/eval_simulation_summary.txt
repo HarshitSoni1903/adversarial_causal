@@ -1,0 +1,15 @@
+
+============================================================
+EVAL SIMULATION
+============================================================
+  Run ID:          w0_20260405_122226
+  World mode:      W0 (independent)
+  Total rounds:    10000
+  Final wealth:    350122.00
+  Investor cumul:  340122.00
+
+  Agent        Policy     Cumulative  Mean Repay%
+  fair_1       fair        150234.75       74.1%
+  max_1        max         147936.75       30.9%
+  fair_2       fair        160819.50       60.0%
+  max_2        max          38307.00       21.3%
