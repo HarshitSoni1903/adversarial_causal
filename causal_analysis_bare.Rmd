@@ -1,0 +1,504 @@
+---
+title: "MRTT Causal Analysis"
+author: "Harshit Soni (hs5666), Gabriel Nixon Raj (gr2513)"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_caption: true
+    keep_tex: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center"
+)
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(knitr)
+library(kableExtra)
+
+set.seed(42)
+
+PROJECT_DIR <- "."
+N_BOOT      <- 1000
+ALPHA       <- 0.05
+```
+
+# Data Loading
+
+```{r load-episode-data}
+dgp_files <- list.files(PROJECT_DIR,
+                         pattern = "^mrtt_dgp_output.*\\.csv$",
+                         full.names = TRUE)
+dgp <- map_dfr(dgp_files, ~ read_csv(.x, show_col_types = FALSE)) %>%
+  distinct(seed, world, episode, .keep_all = TRUE) %>%
+  arrange(seed, world, episode)
+
+cat(sprintf("Episode data: %d rows, %d seeds, %d episodes/seed/world\n",
+            nrow(dgp), n_distinct(dgp$seed),
+            dgp %>% count(seed, world) %>% pull(n) %>% median()))
+```
+
+```{r load-round-data}
+outputs_dir <- file.path(PROJECT_DIR, "outputs")
+run_ids <- unique(dgp$run_id)
+
+parse_hidden <- function(hs_str) {
+  if (is.na(hs_str) || hs_str == "") return(rep(NA_real_, 5))
+  as.numeric(strsplit(gsub("\\[|\\]", "", hs_str), ",\\s*")[[1]])
+}
+
+load_round_data <- function(rid, file_type = "live_game_log.csv") {
+  pth <- file.path(outputs_dir, rid, file_type)
+  if (!file.exists(pth)) return(NULL)
+  tryCatch({
+    df <- read_csv(pth, show_col_types = FALSE)
+
+    # Parse hidden states (only non-NA rows have them — every 100 timesteps)
+    hs_mat <- t(sapply(df$rnn_hidden_state, parse_hidden))
+    colnames(hs_mat) <- paste0("h", 1:ncol(hs_mat))
+    df <- bind_cols(df, as_tibble(hs_mat))
+
+    # Forward-fill hidden state columns within each agent
+    # (hidden state doesn't change between log intervals)
+    df <- df %>%
+      group_by(agent_name) %>%
+      tidyr::fill(all_of(paste0("h", 1:5)), .direction = "down") %>%
+      ungroup()
+
+    df$run_id <- rid
+    meta <- dgp %>% filter(run_id == rid) %>% slice(1) %>% select(seed, world)
+    df$seed <- meta$seed
+    df
+  }, error = function(e) NULL)
+}
+
+round_data_list <- map(run_ids, ~ load_round_data(.x, "live_game_log.csv"))
+round_data_list <- compact(round_data_list)
+
+if (length(round_data_list) > 0) {
+  round_data <- bind_rows(round_data_list)
+  has_round_data <- TRUE
+  cat(sprintf("Round data: %d rows from %d runs\n",
+              nrow(round_data), length(round_data_list)))
+} else {
+  has_round_data <- FALSE
+  cat("No round-level data found. Round-level analysis will be skipped.\n")
+}
+```
+
+```{r extract-run-features}
+extract_run_features <- function(rid) {
+  gl_path <- file.path(outputs_dir, rid, "game_log.csv")
+  if (!file.exists(gl_path)) return(NULL)
+  tryCatch({
+    gl <- read_csv(gl_path, show_col_types = FALSE)
+    agent_stats <- gl %>%
+      group_by(agent_name) %>%
+      summarise(
+        mean_repay = mean(repayment_pct, na.rm = TRUE),
+        sd_repay = sd(repayment_pct, na.rm = TRUE),
+        .groups = "drop")
+
+    fair_hs_vec <- gl$rnn_hidden_state[gl$agent_name == "fair_1"]
+    fair_hs_vec <- fair_hs_vec[!is.na(fair_hs_vec)]
+    fair_hs <- if (length(fair_hs_vec) > 0) parse_hidden(tail(fair_hs_vec, 1)) else rep(NA_real_, 5)
+
+    max_hs_vec <- gl$rnn_hidden_state[gl$agent_name == "max_1"]
+    max_hs_vec <- max_hs_vec[!is.na(max_hs_vec)]
+    max_hs <- if (length(max_hs_vec) > 0) parse_hidden(tail(max_hs_vec, 1)) else rep(NA_real_, 5)
+
+    out <- tibble(
+      run_id = rid,
+      eval_repay_fair = agent_stats$mean_repay[agent_stats$agent_name == "fair_1"],
+      eval_repay_max  = agent_stats$mean_repay[agent_stats$agent_name == "max_1"],
+      eval_sd_fair    = agent_stats$sd_repay[agent_stats$agent_name == "fair_1"],
+      eval_sd_max     = agent_stats$sd_repay[agent_stats$agent_name == "max_1"]
+    )
+    for (d in seq_along(fair_hs)) {
+      out[[paste0("fair_h", d)]] <- fair_hs[d]
+      out[[paste0("max_h", d)]] <- max_hs[d]
+    }
+    out
+  }, error = function(e) NULL)
+}
+
+run_features <- map_dfr(run_ids, extract_run_features)
+if (nrow(run_features) > 0) {
+  dgp_full <- dgp %>% left_join(run_features, by = "run_id")
+} else {
+  dgp_full <- dgp
+}
+```
+
+# Analysis 1: Episode-Level G-Computation
+
+```{r episode-gcomp-setup}
+outcomes <- c("investor_return", "fair_1_repay", "max_1_repay")
+outcome_labels <- c(
+  investor_return = "Investor Return",
+  fair_1_repay    = "Fair Repay",
+  max_1_repay     = "Max Repay"
+)
+
+gcomp <- function(data, outcome, covs, interact = covs) {
+  # Main effects for all covariates, but only `interact` get world: interactions.
+  # Default keeps old behavior. Pass interact=character(0) for no interactions,
+  # or a subset for selective interactions.
+  rhs <- paste(c("world", covs), collapse = " + ")
+  if (length(interact) > 0) {
+    rhs <- paste(c(rhs, paste0("world:", interact)), collapse = " + ")
+  }
+  fit <- lm(as.formula(paste(outcome, "~", rhs)), data = data)
+  d0 <- d1 <- data
+  d0$world <- 0; d1$world <- 1
+  mean(predict(fit, d1) - predict(fit, d0))
+}
+
+# Covariate sets
+covs_A_full_candidates <- c("episode",
+  "eval_repay_fair", "eval_repay_max",
+  "eval_sd_fair", "eval_sd_max",
+  paste0("fair_h", 1:5), paste0("max_h", 1:5))
+covs_A_full <- covs_A_full_candidates[
+  covs_A_full_candidates %in% names(dgp_full) &
+    map_lgl(covs_A_full_candidates, ~ !all(is.na(dgp_full[[.x]])))]
+
+covs_A_lean <- c("episode", "eval_repay_fair", "eval_repay_max")
+covs_A_lean <- covs_A_lean[covs_A_lean %in% names(dgp_full)]
+
+covs_B <- c("episode")
+```
+
+```{r episode-ground-truth}
+gt <- dgp_full %>% group_by(world) %>%
+  summarise(across(all_of(outcomes), mean), .groups = "drop")
+
+ate_true <- tibble(
+  outcome = outcomes,
+  ate_true = map_dbl(outcomes, ~ gt[[.x]][gt$world == 1] - gt[[.x]][gt$world == 0])
+)
+```
+
+```{r episode-point-estimates}
+point_ests <- map_dfr(outcomes, function(y) {
+  w1 <- mean(dgp_full[[y]][dgp_full$world == 1], na.rm = TRUE)
+  w0 <- mean(dgp_full[[y]][dgp_full$world == 0], na.rm = TRUE)
+  tibble(
+    outcome  = y,
+    naive    = w1 - w0,
+    gcomp_A_full = tryCatch(gcomp(dgp_full, y, covs_A_full), error = function(e) NA),
+    gcomp_A_lean = tryCatch(gcomp(dgp_full, y, covs_A_lean), error = function(e) NA),
+    gcomp_B  = tryCatch(gcomp(dgp_full, y, covs_B), error = function(e) NA)
+  )
+})
+
+kable(point_ests, digits = 2,
+      col.names = c("Outcome", "Naive", "G-comp A (Full)", "G-comp A (Lean)", "G-comp B"),
+      caption = "Episode-level point estimates") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, font_size = 10)
+```
+
+```{r episode-bootstrap, cache=TRUE}
+all_seeds <- sort(unique(dgp_full$seed))
+n_seeds <- length(all_seeds)
+
+estimator_names <- c("naive", "A_full", "A_lean", "B")
+
+boot_episode <- map_dfr(seq_len(N_BOOT), function(b) {
+  if (b %% 250 == 0) cat(sprintf("  ep boot [%d/%d]\n", b, N_BOOT))
+  bs <- sample(all_seeds, n_seeds, replace = TRUE)
+  bd <- map2_dfr(bs, seq_along(bs), function(s, i)
+    dgp_full %>% filter(seed == s) %>% mutate(bid = i))
+
+  map_dfr(outcomes, function(y) {
+    w1 <- mean(bd[[y]][bd$world == 1], na.rm = TRUE)
+    w0 <- mean(bd[[y]][bd$world == 0], na.rm = TRUE)
+    tibble(
+      boot = b, outcome = y,
+      naive  = w1 - w0,
+      A_full = tryCatch(gcomp(bd, y, covs_A_full), error = function(e) NA_real_),
+      A_lean = tryCatch(gcomp(bd, y, covs_A_lean), error = function(e) NA_real_),
+      B      = tryCatch(gcomp(bd, y, covs_B),      error = function(e) NA_real_)
+    )
+  })
+})
+```
+
+```{r episode-eval}
+eval_est <- function(ates, truth, alpha = 0.05) {
+  ates <- ates[!is.na(ates)]
+  if (length(ates) == 0) return(tibble(bias=NA, rmse=NA, coverage=NA, se=NA))
+  mn <- mean(ates); se <- sd(ates)
+  z <- qnorm(1 - alpha/2)
+  tibble(
+    bias     = mn - truth,
+    rmse     = sqrt(mean((ates - truth)^2)),
+    coverage = mean((ates - z*se <= truth) & (ates + z*se >= truth)),
+    se       = se
+  )
+}
+
+ep_eval <- map_dfr(outcomes, function(y) {
+  truth <- ate_true$ate_true[ate_true$outcome == y]
+  map_dfr(estimator_names, function(est) {
+    ates <- boot_episode %>% filter(outcome == y) %>% pull(!!sym(est))
+    bind_cols(tibble(outcome = y, estimator = est, truth = truth),
+              eval_est(ates, truth, ALPHA))
+  })
+})
+
+kable(ep_eval %>% mutate(outcome = outcome_labels[outcome]),
+      digits = 4,
+      col.names = c("Outcome","Estimator","True ATE","Bias","RMSE","Coverage","SE"),
+      caption = "Episode-level: Bias, RMSE, 95\\% CI Coverage") %>%
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = FALSE, font_size = 10) %>%
+  column_spec(4, bold = TRUE)
+```
+
+```{r fig-ep-bootstrap, fig.cap="Episode-level bootstrap distributions", fig.height=6}
+est_display <- c(naive = "Naive", A_full = "A (Full)", A_lean = "A (Lean)", B = "B")
+
+boot_ep_long <- boot_episode %>%
+  pivot_longer(all_of(estimator_names), names_to = "estimator", values_to = "ate") %>%
+  mutate(est_label = est_display[estimator],
+         out_label = outcome_labels[outcome])
+
+ggplot(boot_ep_long, aes(x = ate, fill = est_label)) +
+  geom_histogram(alpha = 0.5, bins = 40, position = "identity") +
+  geom_vline(data = ate_true %>% mutate(out_label = outcome_labels[outcome]),
+             aes(xintercept = ate_true), color = "red", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ out_label, scales = "free", ncol = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = "ATE Estimate", y = "Count", fill = "Estimator") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r fig-ep-metrics, fig.cap="Episode-level bias and RMSE", fig.height=4.5, fig.width=9}
+ep_met <- ep_eval %>%
+  select(outcome, estimator, bias, rmse) %>%
+  pivot_longer(c(bias, rmse), names_to = "metric", values_to = "value") %>%
+  mutate(out_label = outcome_labels[outcome], metric = toupper(metric))
+
+ggplot(ep_met, aes(x = estimator, y = value, fill = estimator)) +
+  geom_col(alpha = 0.8, width = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_grid(metric ~ out_label, scales = "free") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = NULL, fill = "Estimator") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r fig-ep-coverage, fig.cap="Episode-level 95\\% CI coverage", fig.height=3.5}
+ggplot(ep_eval, aes(x = estimator, y = coverage, fill = estimator)) +
+  geom_col(alpha = 0.8, width = 0.6) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "red") +
+  facet_wrap(~ outcome_labels[outcome], ncol = 3) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = NULL, y = "Coverage", fill = "Estimator") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r fig-ate-episode, fig.cap="ATE by training episode", fig.height=6}
+ep_means <- dgp_full %>%
+  group_by(episode, world) %>%
+  summarise(across(all_of(outcomes), mean), .groups = "drop")
+ew0 <- ep_means %>% filter(world == 0)
+ew1 <- ep_means %>% filter(world == 1)
+
+episode_ates <- tibble(
+  episode = ew0$episode,
+  `Investor Return` = ew1$investor_return - ew0$investor_return,
+  `Fair Repay` = ew1$fair_1_repay - ew0$fair_1_repay,
+  `Max Repay` = ew1$max_1_repay - ew0$max_1_repay
+) %>% pivot_longer(-episode, names_to = "outcome", values_to = "ate")
+
+ggplot(episode_ates, aes(x = episode, y = ate)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(method = "loess", se = TRUE, color = "steelblue", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ outcome, scales = "free_y", ncol = 1) +
+  labs(x = "Episode", y = "ATE (W1 - W0)") +
+  theme_minimal(base_size = 11)
+```
+
+```{r fig-paired, fig.cap="Within-seed paired differences", fig.height=6}
+sw <- dgp_full %>%
+  group_by(seed, world) %>%
+  summarise(across(all_of(outcomes), mean), .groups = "drop")
+s0 <- sw %>% filter(world == 0) %>% arrange(seed)
+s1 <- sw %>% filter(world == 1) %>% arrange(seed)
+
+seed_diffs <- tibble(
+  seed = s0$seed,
+  `Investor Return` = s1$investor_return - s0$investor_return,
+  `Fair Repay` = s1$fair_1_repay - s0$fair_1_repay,
+  `Max Repay` = s1$max_1_repay - s0$max_1_repay
+) %>% pivot_longer(-seed, names_to = "outcome", values_to = "diff")
+
+ggplot(seed_diffs, aes(x = factor(seed), y = diff)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ outcome, scales = "free_y", ncol = 1) +
+  labs(x = "Seed", y = "W1 - W0") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(size = 6))
+```
+
+
+# Analysis 2: Round-Level G-Computation
+
+```{r round-analysis, eval=has_round_data}
+rd <- round_data %>%
+  filter(timestep %% 50 == 0) %>%
+  mutate(world = world_mode,
+         agent_type = factor(agent_type))
+
+round_outcomes <- c("repayment_pct", "investor_reward")
+round_labels <- c(repayment_pct = "Repayment %", investor_reward = "Investor Reward")
+
+h_cols <- paste0("h", 1:5)
+h_cols <- h_cols[h_cols %in% names(rd) & map_lgl(h_cols, ~ !all(is.na(rd[[.x]])))]
+
+covs_rA <- c("timestep", "investment", "agent_type", h_cols)
+covs_rA_interact <- c("timestep", "investment", "agent_type")  # no world:h interactions
+covs_rB <- c("timestep", "investment", "agent_type")
+
+cat(sprintf("Round data (subsampled): %d rows, h_cols found: %d\n",
+            nrow(rd), length(h_cols)))
+```
+
+```{r round-ground-truth, eval=has_round_data}
+rd_gt <- rd %>% group_by(world) %>%
+  summarise(across(all_of(round_outcomes), mean, na.rm = TRUE), .groups = "drop")
+
+rd_ate_true <- tibble(
+  outcome = round_outcomes,
+  ate_true = map_dbl(round_outcomes, ~ rd_gt[[.x]][rd_gt$world == 1] - rd_gt[[.x]][rd_gt$world == 0])
+)
+
+kable(rd_ate_true, digits = 4,
+      col.names = c("Outcome", "True ATE"),
+      caption = "Round-level ground truth ATEs") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r round-bootstrap, eval=has_round_data, cache=TRUE}
+rd_seeds <- sort(unique(rd$seed))
+n_rd_seeds <- length(rd_seeds)
+
+boot_round <- map_dfr(seq_len(N_BOOT), function(b) {
+  if (b %% 250 == 0) cat(sprintf("  rd boot [%d/%d]\n", b, N_BOOT))
+  bs <- sample(rd_seeds, n_rd_seeds, replace = TRUE)
+  bd <- map2_dfr(bs, seq_along(bs), function(s, i)
+    rd %>% filter(seed == s) %>% mutate(bid = i))
+
+  map_dfr(round_outcomes, function(y) {
+    w1 <- mean(bd[[y]][bd$world == 1], na.rm = TRUE)
+    w0 <- mean(bd[[y]][bd$world == 0], na.rm = TRUE)
+    tibble(
+      boot = b, outcome = y,
+      naive = w1 - w0,
+      A     = tryCatch(gcomp(bd, y, covs_rA, interact = covs_rA_interact), error = function(e) NA_real_),
+      B     = tryCatch(gcomp(bd, y, covs_rB), error = function(e) NA_real_)
+    )
+  })
+})
+```
+
+```{r round-eval, eval=has_round_data}
+rd_est_names <- c("naive", "A", "B")
+
+rd_eval <- map_dfr(round_outcomes, function(y) {
+  truth <- rd_ate_true$ate_true[rd_ate_true$outcome == y]
+  map_dfr(rd_est_names, function(est) {
+    ates <- boot_round %>% filter(outcome == y) %>% pull(!!sym(est))
+    bind_cols(tibble(outcome = y, estimator = est, truth = truth),
+              eval_est(ates, truth, ALPHA))
+  })
+})
+
+kable(rd_eval %>% mutate(outcome = round_labels[outcome]),
+      digits = 4,
+      col.names = c("Outcome","Estimator","True ATE","Bias","RMSE","Coverage","SE"),
+      caption = "Round-level: Bias, RMSE, 95\\% CI Coverage") %>%
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = FALSE, font_size = 10) %>%
+  column_spec(4, bold = TRUE)
+```
+
+```{r fig-rd-bootstrap, eval=has_round_data, fig.cap="Round-level bootstrap distributions", fig.height=4.5}
+rd_est_display <- c(naive = "Naive", A = "A (w/ hidden)", B = "B (no hidden)")
+
+boot_rd_long <- boot_round %>%
+  pivot_longer(all_of(rd_est_names), names_to = "estimator", values_to = "ate") %>%
+  mutate(est_label = rd_est_display[estimator],
+         out_label = round_labels[outcome])
+
+ggplot(boot_rd_long, aes(x = ate, fill = est_label)) +
+  geom_histogram(alpha = 0.5, bins = 40, position = "identity") +
+  geom_vline(data = rd_ate_true %>% mutate(out_label = round_labels[outcome]),
+             aes(xintercept = ate_true), color = "red", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ out_label, scales = "free", ncol = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = "ATE Estimate", y = "Count", fill = "Estimator") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r fig-rd-metrics, eval=has_round_data, fig.cap="Round-level bias and RMSE", fig.height=3.5, fig.width=8}
+rd_met <- rd_eval %>%
+  select(outcome, estimator, bias, rmse) %>%
+  pivot_longer(c(bias, rmse), names_to = "metric", values_to = "value") %>%
+  mutate(out_label = round_labels[outcome], metric = toupper(metric))
+
+ggplot(rd_met, aes(x = estimator, y = value, fill = estimator)) +
+  geom_col(alpha = 0.8, width = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_grid(metric ~ out_label, scales = "free") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = NULL, fill = "Estimator") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+```
+
+# Combined Summary
+
+```{r combined-table}
+combined <- bind_rows(
+  ep_eval %>% mutate(level = "Episode",
+                     outcome = outcome_labels[outcome],
+                     estimator = paste0("ep_", estimator)),
+  if (has_round_data) {
+    rd_eval %>% mutate(level = "Round",
+                       outcome = round_labels[outcome],
+                       estimator = paste0("rd_", estimator))
+  }
+)
+
+kable(combined %>% select(level, outcome, estimator, truth, bias, rmse, coverage, se),
+      digits = 4,
+      col.names = c("Level","Outcome","Estimator","True ATE","Bias","RMSE","Coverage","SE"),
+      caption = "Combined evaluation across both analysis levels") %>%
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = FALSE, font_size = 9) %>%
+  column_spec(5, bold = TRUE)
+```
