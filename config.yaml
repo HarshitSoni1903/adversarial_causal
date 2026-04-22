@@ -1,4 +1,4 @@
-seed: 43
+seed: 76
 data:
   mrtt_dir: data/mrtt
   train_condition: RND
