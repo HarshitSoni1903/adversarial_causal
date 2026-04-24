@@ -70,18 +70,18 @@ adversary:
 game:
   # Agent list. Order defines config-index tie-breaker for trust-ranked allocation.
   # N=1 (Dezfouli replication): one agent. N>=2: multi-agent extension.
-  agents:                            # [EXTENSION] Paper has N=1
-    - name: max_1
-      type: max
-      save_path: "checkpoints/adversary_max_1.pt"
-  # Two-agent example (comment out above, uncomment below):
-  # agents:
+  # agents:                            # [EXTENSION] Paper has N=1
   #   - name: max_1
   #     type: max
-  #     save_path: "checkpoints/adversary_{condition}_max_1.pt"
-  #   - name: fair_1
-  #     type: fair
-  #     save_path: "checkpoints/adversary_{condition}_fair_1.pt"
+  #     save_path: "checkpoints/adversary_max_1.pt"
+  Two-agent example (comment out above, uncomment below):
+  agents:
+    - name: max_1
+      type: max
+      save_path: "checkpoints/adversary_{condition}_max_1.pt"
+    - name: fair_1
+      type: fair
+      save_path: "checkpoints/adversary_{condition}_fair_1.pt"
 
   max_rounds: 10                     # [LOCKED for replication]
   endowment_per_agent: 20            # [LOCKED for replication] per-agent share of wallet
