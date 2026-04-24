@@ -1,28 +1,15 @@
-"""Frozen RNN investor wrapper with optional Q-learner for strategic allocation.
+"""Frozen BehavioralRNN investor: per-agent GRU state management.
 
-When learns=False (default): the frozen BehavioralRNN makes all investment
-decisions independently per agent. No learning occurs. This is the original
-Dezfouli surrogate investor.
+The investor is a surrogate for the human participant in Dezfouli et al. (2020).
+It is frozen (no learning) and drives investment decisions via incremental GRU steps.
 
-When learns=True: the frozen RNN still runs every step (producing hidden
-states and behavioral features), but a Q-learner makes the actual investment
-decisions using cross-agent information. The RNN provides features; the
-Q-learner provides strategy. Neither modifies the other.
+Per-agent state maintained across rounds:
+  _h[name]       : (1, 1, hidden_size) GRU hidden state
+  _prev_ah[name] : (n_actions,) one-hot of last action (zeros at t=0)
+  _prev_rp[name] : float repayment proportion from last round (0.0 at t=0)
 
-Q-learner state vector for deciding investment in agent_i:
-  [rnn_hidden_all (64*k), prev_returns (k), cumulative_returns (k),
-   wealth_scaled (1), round_scaled (1)]
-  state_dim = 64*k + 2*k + 2
-
-Uses incremental GRU evaluation: each call to act() feeds only the current
-step through the GRU (with the cached hidden state), O(1) per step.
-
-Reward signal: the total investor reward for the round (sum across all agents),
-delivered via receive_round_reward() after all agents have acted. Within a
-round, intermediate transitions get reward 0 (sparse-reward MDP).
-
-Actions are returned in TRAINING scale (0-20). The game loop maps to the
-simulation's endowment and clamps to available wealth.
+act(agent_name) caches (h_predecision, policy_vec, action_onehot) between
+act() and observe_outcome(). game.py calls get_rnn_info() to build adversary states.
 """
 
 from __future__ import annotations
@@ -31,292 +18,94 @@ import numpy as np
 import torch
 
 from models.behavioral_rnn import load_behavioral_rnn
-from models.q_learner import QLearner
-from utils import get_checkpoint_dir
+from utils import bucket_investment
 
 
 class RNNInvestor:
 
-    def __init__(
-        self,
-        config: dict,
-        agent_names: list[str],
-        device: str = "cpu",
-        run_id: str | None = None,
-    ) -> None:
+    def __init__(self, config: dict, agent_names: list[str], device: str = "cpu") -> None:
         rnn_cfg = config["behavioral_rnn"]
-        data_cfg = config["data"]
-        self._run_id = run_id
-
         self.model = load_behavioral_rnn(rnn_cfg["save_path"], device=device)
         self.device = device
-        self.rnn_actions: list[int] = rnn_cfg["actions"]
-        self.original_endowment: int = data_cfg["original_endowment"]
-        self.original_rounds: int = data_cfg["original_rounds"]
-        self.multiplier: int = data_cfg["multiplier"]
+        self.action_values: list[int] = rnn_cfg["action_values"]
+        self.n_actions: int = rnn_cfg["n_actions"]
+        self.inference_sample: bool = rnn_cfg.get("inference_sample", True)
+        self.bucketing_rule: str = config["data"]["bucketing_rule"]
         self.agent_names = agent_names
-        self.config = config
 
-        self._tracking: dict[str, dict] = {}
-        self._hidden_cache: dict[str, torch.Tensor] = {}
-
-        # --- Optional Q-learner ---
-        self.learns: bool = config.get("investor", {}).get("learns", False)
-        self.q_learner: QLearner | None = None
-        self.eval_mode: bool = False
-
-        if self.learns:
-            inv_cfg = config["investor"]
-            self.ql_actions: list[int] = inv_cfg["actions"]
-            k = len(agent_names)
-            rnn_hidden_size = rnn_cfg["hidden_size"]
-            # state = [agent_one_hot(k) + all_hiddens(64*k) + prev_returns(k) + cum_returns(k) + wealth(1) + round(1)]
-            state_dim = k + rnn_hidden_size * k + 2 * k + 2
-            action_dim = len(self.ql_actions)
-            self.q_learner = QLearner(state_dim, action_dim, inv_cfg, device)
-
-            self._initial_endowment: float = float(config["game"]["endowment"])
-            self._current_wealth: float = self._initial_endowment
-            self._training_rounds: int = config["dqn"].get("training_rounds", 50)
-
-            self._prev_returns: dict[str, float] = {}
-            self._cumulative_returns: dict[str, float] = {}
-            self._prev_state: np.ndarray | None = None
-            self._prev_action: int | None = None
-            self._prev_reward: float = 0.0
-            self._update_counter: int = 0
+        # Per-agent GRU state (reset each episode)
+        self._h: dict[str, torch.Tensor] = {}
+        self._prev_ah: dict[str, torch.Tensor] = {}
+        self._prev_rp: dict[str, float] = {}
+        # Cached after act(), read by game.py via get_rnn_info()
+        self._h_predecision: dict[str, np.ndarray] = {}
+        self._policy_vec: dict[str, np.ndarray] = {}
+        self._action_onehot: dict[str, np.ndarray] = {}
 
         self.reset()
 
-    # ------------------------------------------------------------------
-    # Reset
-    # ------------------------------------------------------------------
-
     def reset(self) -> None:
-        """Clear all per-agent tracking and hidden state caches."""
+        hs = self.model.hidden_size
+        zero_ah = torch.zeros(self.n_actions, dtype=torch.float32)
         for name in self.agent_names:
-            self._tracking[name] = {
-                "prev_repay_prop": None,
-                "prev_action": None,
-                "prev_reward": None,
-                "step_count": 0,
-            }
-            self._hidden_cache[name] = torch.zeros(
-                1, 1, self.model.hidden_size, device=self.device,
-            )
+            self._h[name] = torch.zeros(1, 1, hs, device=self.device)
+            self._prev_ah[name] = zero_ah.clone()
+            self._prev_rp[name] = 0.0
+            self._h_predecision[name] = np.zeros(hs, dtype=np.float32)
+            self._policy_vec[name] = np.full(self.n_actions, 1.0 / self.n_actions, dtype=np.float32)
+            self._action_onehot[name] = np.zeros(self.n_actions, dtype=np.float32)
 
-        if self.learns:
-            self._current_wealth = self._initial_endowment
-            self._prev_returns = {n: 0.0 for n in self.agent_names}
-            self._cumulative_returns = {n: 0.0 for n in self.agent_names}
-            self._prev_state = None
-            self._prev_action = None
-            self._prev_reward = 0.0
-            self._update_counter = 0
-
-    # ------------------------------------------------------------------
-    # RNN encoding / stepping
-    # ------------------------------------------------------------------
-
-    def _encode_step(self, agent_name: str) -> list[float]:
-        """Encode current step for an agent, rescaled to training distribution."""
-        trk = self._tracking[agent_name]
-        round_scale = max(self.original_rounds - 1, 1)
-        endow = self.original_endowment
-
-        round_scaled = min(trk["step_count"] / round_scale, 1.0)
-
-        if trk["prev_repay_prop"] is None:
-            return [round_scaled, 0.0, 0.0, 0.0]
-
-        prev_repay_prop = float(np.clip(trk["prev_repay_prop"], 0.0, 1.0))
-        prev_invest_scaled = min(trk["prev_action"] / endow, 1.0)
-        prev_reward_scaled = float(np.clip(trk["prev_reward"] / endow, -1.0, 1.0))
-
-        return [round_scaled, prev_repay_prop, prev_invest_scaled, prev_reward_scaled]
-
-    @torch.no_grad()
-    def _step_rnn(self, agent_name: str) -> None:
-        """Run one incremental GRU step to update hidden state cache."""
-        enc = self._encode_step(agent_name)
-        x = torch.tensor([[enc]], dtype=torch.float32, device=self.device)
-        h_prev = self._hidden_cache[agent_name]
-        _, h_new = self.model.rnn(x, h_prev)
-        self._hidden_cache[agent_name] = h_new
-
-    # ------------------------------------------------------------------
-    # Action selection
-    # ------------------------------------------------------------------
-
-    def act(
-        self,
-        agent_name: str,
-        *,
-        round_num: int = 0,
-        max_rounds: int = 1,
-    ) -> float:
-        """Decide investment for a specific agent (training scale 0-20).
-
-        When learns=False: frozen RNN samples an action.
-        When learns=True: frozen RNN updates hidden state, Q-learner picks action.
-        """
-        with torch.no_grad():
-            self._step_rnn(agent_name)
-
-        if not self.learns:
-            with torch.no_grad():
-                h = self.model.dropout(self._hidden_cache[agent_name][-1])
-                logits = self.model.head(h)
-                probs = torch.softmax(logits, dim=-1).squeeze(0)
-                action_idx = int(torch.multinomial(probs, 1).item())
-            return float(self.rnn_actions[action_idx])
-
-        # --- Q-learner mode ---
-        state = self._build_ql_state(agent_name, round_num, max_rounds)
-
-        if not self.eval_mode and self._prev_state is not None:
-            self.q_learner.store_transition(
-                self._prev_state, self._prev_action,
-                self._prev_reward, state, False,
-            )
-            if self._update_counter % 10 == 0:
-                self.q_learner.update()
-            self._update_counter += 1
-            self._prev_reward = 0.0
-
-        action_idx = self.q_learner.select_action(state, greedy=self.eval_mode)
-        investment = float(self.ql_actions[action_idx])
-
-        self._prev_state = state
-        self._prev_action = action_idx
-
-        return investment
-
-    def _build_ql_state(
-        self, agent_name: str, round_num: int, max_rounds: int,
-    ) -> np.ndarray:
-        """Build cross-agent state vector for the Q-learner.
-
-        Includes a one-hot encoding of which agent is being invested in,
-        so the Q-learner can learn different investment policies per agent.
-
-        IMPORTANT: round_scaled and wealth_scaled are normalized using
-        training-regime values (training_rounds, initial_endowment) so
-        the Q-network sees the same input distribution during simulation
-        as during training. Without this, the Q-network gets alien inputs
-        during 10k-round simulation and can't generalize.
-        """
-        # One-hot: which agent are we deciding for?
-        agent_onehot = np.zeros(len(self.agent_names), dtype=np.float32)
-        agent_onehot[self.agent_names.index(agent_name)] = 1.0
-
-        all_hiddens = [
-            self._hidden_cache[n].squeeze().cpu().numpy()
-            for n in self.agent_names
-        ]
-        prev_rets = np.array(
-            [self._prev_returns[n] for n in self.agent_names], dtype=np.float32,
+    def act(self, agent_name: str) -> float:
+        """Run one GRU step, sample action, cache state info. Returns desired investment."""
+        h_new, policy_vec = self.model.step_forward(
+            self._h[agent_name],
+            self._prev_ah[agent_name].to(self.device),
+            self._prev_rp[agent_name],
         )
-        # Normalize cumulative returns to training scale
-        # During training (50 rounds), cum_rets is ~0-2000. During simulation
-        # (10k rounds), it can be 0-600k. Divide by initial endowment to keep
-        # it in a reasonable range the Q-network was trained on.
-        raw_cum = np.array(
-            [self._cumulative_returns[n] for n in self.agent_names], dtype=np.float32,
-        )
-        cum_rets = raw_cum / self._initial_endowment
-        # Normalize using training regime, not simulation regime
-        wealth_scaled = np.float32(
-            np.clip(self._current_wealth / self._initial_endowment, 0.0, 10.0)
-        )
-        round_scaled = np.float32(
-            min(round_num / max(self._training_rounds - 1, 1), 1.0)
-        )
+        self._h[agent_name] = h_new
 
-        return np.concatenate([
-            agent_onehot, *all_hiddens, prev_rets, cum_rets,
-            [wealth_scaled, round_scaled],
-        ]).astype(np.float32)
+        h_arr = h_new.squeeze().cpu().numpy()   # (hidden_size,)
+        p_arr = policy_vec.cpu().numpy()         # (n_actions,)
 
-    # ------------------------------------------------------------------
-    # Observation / feedback from game
-    # ------------------------------------------------------------------
+        if self.inference_sample:
+            action_idx = int(torch.multinomial(policy_vec, 1).item())
+        else:
+            action_idx = int(policy_vec.argmax().item())
 
-    @torch.no_grad()
-    def get_hidden_state(self, agent_name: str) -> np.ndarray:
-        """Return cached GRU hidden state as 1D numpy array (hidden_size,)."""
-        h = self._hidden_cache[agent_name]
-        return h.squeeze().cpu().numpy()
+        ah = np.zeros(self.n_actions, dtype=np.float32)
+        ah[action_idx] = 1.0
+
+        self._h_predecision[agent_name] = h_arr
+        self._policy_vec[agent_name] = p_arr
+        self._action_onehot[agent_name] = ah
+
+        return float(self.action_values[action_idx])
 
     def observe_outcome(
-        self,
-        agent_name: str,
-        investment: float,
-        repayment: float,
-        reward: float,
+        self, agent_name: str, actual_investment: float, repay_prop: float,
     ) -> None:
-        """Update tracking after a round resolves. Values are in simulation scale.
+        """Store actual round outcomes as inputs for the next GRU step."""
+        idx = bucket_investment(int(round(actual_investment)), self.bucketing_rule)
+        ah = torch.zeros(self.n_actions, dtype=torch.float32)
+        ah[idx] = 1.0
+        self._prev_ah[agent_name] = ah
+        self._prev_rp[agent_name] = float(np.clip(repay_prop, 0.0, 1.0))
 
-        When learning, the per-agent reward is set immediately so the Q-learner
-        can attribute profit/loss to the specific agent investment decision.
-        """
-        trk = self._tracking[agent_name]
-        inv_mult = investment * self.multiplier
-        trk["prev_repay_prop"] = repayment / inv_mult if inv_mult > 0 else 0.0
-        trk["prev_action"] = investment
-        trk["prev_reward"] = reward
-        trk["step_count"] += 1
+    def get_rnn_info(self, agent_name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (h_predecision, policy_vec, action_onehot) cached after act()."""
+        return (
+            self._h_predecision[agent_name].copy(),
+            self._policy_vec[agent_name].copy(),
+            self._action_onehot[agent_name].copy(),
+        )
 
-        if self.learns:
-            self._prev_returns[agent_name] = reward
-            self._cumulative_returns[agent_name] += reward
-            self._current_wealth += reward
-            # Per-agent reward: investor learns which agent is profitable
-            self._prev_reward = reward
+    def get_hidden_state(self, agent_name: str) -> np.ndarray:
+        """Return current GRU hidden state as (hidden_size,) numpy array."""
+        return self._h[agent_name].squeeze().cpu().detach().numpy().copy()
 
-    def receive_round_reward(self, total_round_reward: float) -> None:
-        """Legacy — kept for backward compatibility. Per-agent reward is now
-        set directly in observe_outcome()."""
-        pass
-
-    def observe_done(self) -> None:
-        """Called at episode end to store the terminal Q-learner transition."""
-        if self.learns and not self.eval_mode and self._prev_state is not None:
-            terminal_state = np.zeros_like(self._prev_state)
-            self.q_learner.store_transition(
-                self._prev_state, self._prev_action, self._prev_reward,
-                terminal_state, True,
-            )
-            if self._update_counter % 10 == 0:
-                self.q_learner.update()
-            self._update_counter += 1
-            self._prev_state = None
-            self._prev_action = None
-
-    # ------------------------------------------------------------------
-    # Training lifecycle
-    # ------------------------------------------------------------------
-
-    def set_eval_mode(self, mode: bool = True) -> None:
-        """Toggle evaluation mode: greedy actions, no learning."""
-        if self.learns:
-            self.eval_mode = mode
-
-    def decay_epsilon(self) -> None:
-        """Decay Q-learner epsilon once per episode."""
-        if self.learns:
-            self.q_learner.decay_epsilon()
-
-    def save(self, path: str | None = None) -> None:
-        """Save Q-learner weights."""
-        if self.learns:
-            save_name = self.config["investor"]["save_name"]
-            path = path or f"{get_checkpoint_dir(self.config, self._run_id)}/{save_name}"
-            self.q_learner.save(path)
-
-    def load(self, path: str | None = None) -> None:
-        """Load Q-learner weights."""
-        if self.learns:
-            save_name = self.config["investor"]["save_name"]
-            path = path or f"{get_checkpoint_dir(self.config, self._run_id)}/{save_name}"
-            self.q_learner.load(path)
+    def set_hidden_state(self, agent_name: str, h_arr: np.ndarray) -> None:
+        """Set GRU hidden state from (hidden_size,) numpy array."""
+        hs = self.model.hidden_size
+        self._h[agent_name] = torch.tensor(
+            h_arr, dtype=torch.float32, device=self.device,
+        ).reshape(1, 1, hs)

@@ -3,6 +3,8 @@
 Walks data/mrtt/<condition>/<subject_id>/data/output.csv files,
 cleans and computes derived columns, and saves a single CSV for
 training the BehavioralRNN learner model.
+
+Output columns: episode_id, round, investment, repay_prop.
 """
 
 import sys
@@ -24,7 +26,6 @@ def parse_mrtt(cfg: dict) -> pd.DataFrame:
     data_cfg = cfg["data"]
     condition = data_cfg["train_condition"]
     mrtt_dir = Path(data_cfg["mrtt_dir"])
-    endowment = data_cfg["original_endowment"]
     multiplier = data_cfg["multiplier"]
 
     condition_dir = mrtt_dir / condition
@@ -45,11 +46,10 @@ def parse_mrtt(cfg: dict) -> pd.DataFrame:
             else 0.0,
             axis=1,
         )
-        df["reward"] = endowment - df["investment"] + df["repay"]
         df["round"] = range(len(df))
         df["episode_id"] = episode_id
 
-        rows.append(df[["episode_id", "round", "investment", "repay_prop", "reward"]])
+        rows.append(df[["episode_id", "round", "investment", "repay_prop"]])
 
     return pd.concat(rows, ignore_index=True)
 
@@ -60,7 +60,7 @@ def main() -> None:
     output_path = Path(cfg["data"]["output_path"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_csv(output_path, index=False)
-    print(f"Saved {output_path}  shape={dataset.shape}")
+    print(f"Saved {output_path}  shape={dataset.shape}  columns={list(dataset.columns)}")
 
 
 if __name__ == "__main__":

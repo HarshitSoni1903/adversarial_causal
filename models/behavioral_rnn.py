@@ -1,23 +1,28 @@
 """BehavioralRNN: GRU learner model from Dezfouli et al. (2020).
 
-Supervised model trained to predict a human investor's next discretized
-action given the sequence of past rounds. After training, this model is
-frozen and used as the investor surrogate in adversary training and
-simulation. Model definition only — no training logic here.
+Architecture (faithful to paper):
+  - Input: 6-dim = prev_action_onehot(5) + prev_repay_prop(1)
+  - Prepend zero dummy so round-0 action is in the training loss
+  - GRU hidden_size=5, dropout=0.2, linear head → 5 action logits
+
+Two usage modes:
+  Training  : forward(x)  — x is (batch, n_rounds, 6), returns per-step logits
+              (batch, n_rounds, n_actions). Loss is summed over all time steps.
+  Simulation: step_forward(h_prev, action_onehot, repay_prop) — single incremental
+              GRU step, returns (h_new, policy_vec). Called once per agent per round.
 """
 
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.nn.utils.rnn import pack_padded_sequence
 
 
 class BehavioralRNN(nn.Module):
 
     def __init__(
         self,
-        input_size: int = 4,
-        hidden_size: int = 16,
+        input_size: int = 6,
+        hidden_size: int = 5,
         n_actions: int = 5,
         dropout: float = 0.2,
     ) -> None:
@@ -29,26 +34,56 @@ class BehavioralRNN(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(hidden_size, n_actions)
 
-    def forward(self, x: Tensor, lengths: Tensor) -> Tensor:
-        """Return logits of shape (batch, n_actions)."""
-        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        _, h_n = self.rnn(packed)
-        h = self.dropout(h_n[-1])
-        return self.head(h)
+    def forward(self, x: Tensor) -> Tensor:
+        """Full-sequence forward for training.
 
-    def get_hidden_state(self, x: Tensor, lengths: Tensor) -> Tensor:
-        """Return raw GRU hidden state h_n of shape (batch, hidden_size).
+        Args:
+            x: (batch, seq_len, input_size=6)
 
-        No dropout or linear head — this vector is passed to the adversary
-        as part of its RL state.
+        Returns:
+            logits: (batch, seq_len, n_actions)
         """
-        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        _, h_n = self.rnn(packed)
-        return h_n[-1]
+        h, _ = self.rnn(x)                     # (batch, seq_len, hidden_size)
+        h = self.dropout(h)
+        return self.head(h)                     # (batch, seq_len, n_actions)
 
-    def predict_probs(self, x: Tensor, lengths: Tensor) -> Tensor:
-        """Return action probabilities of shape (batch, n_actions)."""
-        return torch.softmax(self.forward(x, lengths), dim=-1)
+    @torch.no_grad()
+    def step_forward(
+        self,
+        h_prev: Tensor,
+        action_onehot: Tensor,
+        repay_prop: float,
+    ) -> tuple[Tensor, Tensor]:
+        """Single incremental GRU step for simulation.
+
+        Called once per agent per round with the PREVIOUS round's features
+        (or zeros at t=0). Returns the pre-decision hidden state and the
+        action probability distribution derived from it.
+
+        Args:
+            h_prev: (1, 1, hidden_size) — previous hidden state
+            action_onehot: (n_actions,) tensor — one-hot of previous action
+            repay_prop: float — previous repayment proportion
+
+        Returns:
+            h_new: (1, 1, hidden_size)
+            policy_vec: (n_actions,) softmax distribution
+        """
+        inp = torch.cat([
+            action_onehot.float(),
+            torch.tensor([repay_prop], dtype=torch.float32, device=h_prev.device),
+        ]).unsqueeze(0).unsqueeze(0)            # (1, 1, 6)
+        _, h_new = self.rnn(inp, h_prev)
+        # Dropout is disabled during eval/no_grad; apply linear head directly
+        policy_vec = torch.softmax(
+            self.head(h_new.squeeze(0)),        # (1, n_actions)
+            dim=-1,
+        ).squeeze(0)                            # (n_actions,)
+        return h_new, policy_vec
+
+    def predict_probs(self, x: Tensor) -> Tensor:
+        """Return per-step action probabilities (batch, seq_len, n_actions)."""
+        return torch.softmax(self.forward(x), dim=-1)
 
     def freeze(self) -> None:
         """Freeze all parameters and switch to eval mode."""
@@ -62,7 +97,8 @@ def load_behavioral_rnn(checkpoint_path: str, device: str = "cpu") -> Behavioral
     model = BehavioralRNN(
         input_size=ckpt["input_size"],
         hidden_size=ckpt["hidden_size"],
-        n_actions=len(ckpt["actions"]),
+        n_actions=ckpt["n_actions"],
+        dropout=ckpt.get("dropout", 0.2),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.freeze()

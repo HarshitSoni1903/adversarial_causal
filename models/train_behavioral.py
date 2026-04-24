@@ -1,10 +1,14 @@
 """Phase 2: Train BehavioralRNN on parsed human behavioral data.
 
-Loads the CSV from Phase 1, builds sequential (history -> next action) examples,
-trains a GRU classifier with class-weighted cross-entropy, and saves the best
-checkpoint by test loss. All hyperparameters come from config.yaml.
+Dezfouli-faithful training format:
+  - One (sequence, targets) example per episode.
+  - Sequence length = n_rounds (including prepended dummy at position 0).
+  - Targets = bucket indices for all n_rounds actions.
+  - Loss = cross-entropy summed over all n_rounds timesteps (not just last).
 
-Functions in this module are public so tune_behavioral.py can reuse them.
+Bucketing rule is configurable (paper_range | nearest_neighbor); see utils.bucket_investment.
+
+Supports batch mode (default, Dezfouli-faithful) and iterative mode (extension).
 """
 
 import sys
@@ -22,52 +26,58 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.behavioral_rnn import BehavioralRNN, load_behavioral_rnn
-from utils import action_to_idx, load_config, set_all_seeds
+from utils import bucket_investment, load_config, set_all_seeds
 
 
 # ---------------------------------------------------------------------------
-# Dataset construction
+# Dataset construction (Dezfouli format: one example per episode, per-step)
 # ---------------------------------------------------------------------------
 
 def encode_episodes(
     df: pd.DataFrame,
     episode_ids: list[str],
-    actions: list[int],
-    endowment: int,
+    action_values: list[int],
+    bucketing_rule: str,
     n_rounds: int,
-) -> tuple[list[np.ndarray], list[int]]:
-    """Build (sequence, target) pairs from episode data.
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Build per-episode (sequence, targets) pairs.
 
-    For each episode, for each round t >= 1 the input sequence is the
-    encoded steps 0..t-1 and the target is the discretized action at t.
+    Each episode produces ONE training example:
+      sequence: shape (n_rounds, 6) where
+        - row 0 = zero dummy (no prior information before round 0)
+        - row t (t>=1) = [prev_action_onehot(5), prev_repay_prop(1)]
+      targets:  shape (n_rounds,) of int bucket indices [0..4]
+
+    All n_rounds timesteps contribute to the loss (Dezfouli's
+    "loss sums cross-entropy over ALL timesteps" convention).
     """
-    round_scale = n_rounds - 1
     sequences: list[np.ndarray] = []
-    targets: list[int] = []
+    targets: list[np.ndarray] = []
 
     for eid in episode_ids:
         ep = df[df["episode_id"] == eid].sort_values("round").reset_index(drop=True)
+        if len(ep) != n_rounds:
+            continue  # skip incomplete episodes
 
-        encoded: list[list[float]] = []
-        for t in range(len(ep)):
-            row = ep.iloc[t]
-            if t == 0:
-                enc = [row["round"] / round_scale, 0.0, 0.0, 0.0]
-            else:
+        inp = np.zeros((n_rounds, 6), dtype=np.float32)
+        tgt = np.zeros(n_rounds, dtype=np.int64)
+
+        for t in range(n_rounds):
+            # Row t of sequence = features from round t-1 (dummy at t=0)
+            if t > 0:
                 prev = ep.iloc[t - 1]
-                enc = [
-                    row["round"] / round_scale,
-                    prev["repay_prop"],
-                    prev["investment"] / endowment,
-                    prev["reward"] / endowment,
-                ]
-            encoded.append(enc)
+                prev_idx = bucket_investment(int(prev["investment"]), bucketing_rule)
+                onehot = np.zeros(5, dtype=np.float32)
+                onehot[prev_idx] = 1.0
+                inp[t, :5] = onehot
+                inp[t, 5] = float(prev["repay_prop"])
+            # else: row 0 stays all zeros (dummy)
 
-            if t >= 1:
-                seq = np.array(encoded[:t], dtype=np.float32)
-                target = action_to_idx(row["investment"], actions)
-                sequences.append(seq)
-                targets.append(target)
+            # Target = bucket of round t's investment
+            tgt[t] = bucket_investment(int(ep.iloc[t]["investment"]), bucketing_rule)
+
+        sequences.append(inp)
+        targets.append(tgt)
 
     return sequences, targets
 
@@ -84,48 +94,43 @@ def split_episodes(
 
 
 class BehavioralDataset(Dataset):
-    def __init__(self, sequences: list[np.ndarray], targets: list[int]) -> None:
+    def __init__(self, sequences: list[np.ndarray], targets: list[np.ndarray]) -> None:
         self.sequences = sequences
         self.targets = targets
 
     def __len__(self) -> int:
         return len(self.targets)
 
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, int]:
+    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
         return self.sequences[idx], self.targets[idx]
 
 
 def collate_fn(
-    batch: list[tuple[np.ndarray, int]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Left-pad sequences to the max length in the batch."""
+    batch: list[tuple[np.ndarray, np.ndarray]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stack fixed-length sequences into batch tensors."""
     seqs, tgts = zip(*batch)
-    lengths = torch.tensor([len(s) for s in seqs], dtype=torch.long)
-    max_len = int(lengths.max())
-    input_size = seqs[0].shape[1]
-
-    padded = torch.zeros(len(seqs), max_len, input_size)
-    for i, s in enumerate(seqs):
-        offset = max_len - len(s)
-        padded[i, offset:] = torch.from_numpy(s)
-
-    return padded, lengths, torch.tensor(tgts, dtype=torch.long)
+    return (
+        torch.tensor(np.stack(seqs), dtype=torch.float32),   # (B, T, 6)
+        torch.tensor(np.stack(tgts), dtype=torch.long),      # (B, T)
+    )
 
 
 # ---------------------------------------------------------------------------
 # Class weights
 # ---------------------------------------------------------------------------
 
-def compute_class_weights(targets: list[int], n_actions: int) -> torch.Tensor:
-    counts = np.bincount(targets, minlength=n_actions).astype(np.float64)
+def compute_class_weights(targets: list[np.ndarray], n_actions: int) -> torch.Tensor:
+    flat = np.concatenate(targets)
+    counts = np.bincount(flat, minlength=n_actions).astype(np.float64)
     counts = np.maximum(counts, 1.0)
-    weights = len(targets) / counts
+    weights = len(flat) / counts
     weights /= weights.mean()
     return torch.tensor(weights, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
-# Train / eval loops
+# Training / eval loops
 # ---------------------------------------------------------------------------
 
 def train_epoch(
@@ -138,19 +143,20 @@ def train_epoch(
 ) -> tuple[float, float]:
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    for padded, lengths, tgts in loader:
-        padded, lengths, tgts = padded.to(device), lengths, tgts.to(device)
-        logits = model(padded, lengths)
-        loss = criterion(logits, tgts)
+    for seqs, tgts in loader:
+        seqs, tgts = seqs.to(device), tgts.to(device)       # (B, T, 6), (B, T)
+        logits = model(seqs)                                  # (B, T, n_actions)
+        B, T, A = logits.shape
+        loss = criterion(logits.reshape(B * T, A), tgts.reshape(B * T))
 
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_loss += loss.item() * len(tgts)
-        correct += (logits.argmax(1) == tgts).sum().item()
-        total += len(tgts)
+        total_loss += loss.item() * (B * T)
+        correct += (logits.argmax(-1) == tgts).sum().item()
+        total += B * T
 
     return total_loss / total, correct / total
 
@@ -164,149 +170,123 @@ def eval_epoch(
 ) -> tuple[float, float]:
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
-    for padded, lengths, tgts in loader:
-        padded, lengths, tgts = padded.to(device), lengths, tgts.to(device)
-        logits = model(padded, lengths)
-        loss = criterion(logits, tgts)
-        total_loss += loss.item() * len(tgts)
-        correct += (logits.argmax(1) == tgts).sum().item()
-        total += len(tgts)
-
+    for seqs, tgts in loader:
+        seqs, tgts = seqs.to(device), tgts.to(device)
+        logits = model(seqs)
+        B, T, A = logits.shape
+        loss = criterion(logits.reshape(B * T, A), tgts.reshape(B * T))
+        total_loss += loss.item() * (B * T)
+        correct += (logits.argmax(-1) == tgts).sum().item()
+        total += B * T
     return total_loss / total, correct / total
-
-
-@torch.no_grad()
-def compute_test_nll(
-    model: BehavioralRNN,
-    loader: DataLoader,
-    device: torch.device,
-) -> float:
-    """Return average negative log-likelihood per sample on the test set."""
-    model.eval()
-    total_nll, n_samples = 0.0, 0
-    for padded, lengths, tgts in loader:
-        probs = model.predict_probs(padded.to(device), lengths).cpu()
-        for i, t in enumerate(tgts.tolist()):
-            total_nll -= np.log(max(probs[i, t].item(), 1e-12))
-        n_samples += len(tgts)
-    return total_nll / n_samples
-
-
-# ---------------------------------------------------------------------------
-# Post-training diagnostics
-# ---------------------------------------------------------------------------
-
-def save_curves(
-    train_losses: list[float],
-    test_losses: list[float],
-    train_accs: list[float],
-    test_accs: list[float],
-    save_dir: Path,
-) -> None:
-    epochs = range(1, len(train_losses) + 1)
-
-    plt.figure()
-    plt.plot(epochs, train_losses, label="train")
-    plt.plot(epochs, test_losses, label="test")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_dir / "behavioral_rnn_training.png", dpi=150)
-    plt.close()
-
-    plt.figure()
-    plt.plot(epochs, train_accs, label="train")
-    plt.plot(epochs, test_accs, label="test")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_dir / "behavioral_rnn_accuracy.png", dpi=150)
-    plt.close()
-
-
-@torch.no_grad()
-def save_predictions(
-    model: BehavioralRNN,
-    loader: DataLoader,
-    actions: list[int],
-    device: torch.device,
-    save_dir: Path,
-) -> None:
-    model.eval()
-    all_preds, all_targets = [], []
-    for padded, lengths, tgts in loader:
-        logits = model(padded.to(device), lengths)
-        all_preds.extend(logits.argmax(1).cpu().tolist())
-        all_targets.extend(tgts.tolist())
-
-    pred_actions = [actions[i] for i in all_preds]
-    true_actions = [actions[i] for i in all_targets]
-    pd.DataFrame({"true": true_actions, "predicted": pred_actions}).to_csv(
-        save_dir / "behavioral_rnn_predictions.csv", index=False,
-    )
-
-    n = len(actions)
-    cm = np.zeros((n, n), dtype=int)
-    for t, p in zip(all_targets, all_preds):
-        cm[t][p] += 1
-    cm_df = pd.DataFrame(cm, index=actions, columns=actions)
-    cm_df.to_csv(save_dir / "behavioral_rnn_confusion.csv")
 
 
 @torch.no_grad()
 def print_full_metrics(
     model: BehavioralRNN,
     loader: DataLoader,
-    actions: list[int],
+    n_actions: int,
+    action_values: list[int],
     device: torch.device,
 ) -> None:
-    """Print comprehensive evaluation metrics on the test set."""
     model.eval()
     all_preds: list[int] = []
     all_targets: list[int] = []
-    all_true_probs: list[float] = []
     total_nll = 0.0
 
-    for padded, lengths, tgts in loader:
-        probs = model.predict_probs(padded.to(device), lengths).cpu()
-        preds = probs.argmax(1)
-        all_preds.extend(preds.tolist())
-        all_targets.extend(tgts.tolist())
-
-        for i, t in enumerate(tgts.tolist()):
-            p_true = probs[i, t].item()
-            all_true_probs.append(p_true)
-            total_nll -= np.log(max(p_true, 1e-12))
+    for seqs, tgts in loader:
+        probs = model.predict_probs(seqs.to(device))         # (B, T, n_actions)
+        preds = probs.argmax(-1)                              # (B, T)
+        B, T, A = probs.shape
+        all_preds.extend(preds.reshape(-1).cpu().tolist())
+        all_targets.extend(tgts.reshape(-1).tolist())
+        for b in range(B):
+            for t in range(T):
+                total_nll -= np.log(max(probs[b, t, tgts[b, t]].item(), 1e-12))
 
     y_true = np.array(all_targets)
     y_pred = np.array(all_preds)
-    n_samples = len(y_true)
-
+    n = len(y_true)
+    acc = (y_true == y_pred).mean()
     macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    weighted_f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-    accuracy = (y_true == y_pred).mean()
-
-    print("\n=== Summary Metrics ===")
-    print(f"  Accuracy:     {accuracy:.3f}")
-    print(f"  Macro F1:     {macro_f1:.3f}")
-    print(f"  Weighted F1:  {weighted_f1:.3f}")
-
-    avg_nll = total_nll / n_samples
-    avg_true_prob = np.mean(all_true_probs)
-    print(f"  Avg NLL/sample:         {avg_nll:.4f}")
-    print(f"  Avg P(correct action):  {avg_true_prob:.3f}  "
-          f"({avg_true_prob*100:.1f}% probability assigned to what human chose)")
-
-    labels = list(range(len(actions)))
-    prec, rec, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, zero_division=0,
+    print(f"\n=== Test Metrics ===")
+    print(f"  Accuracy:    {acc:.3f}")
+    print(f"  Macro F1:    {macro_f1:.3f}")
+    print(f"  Avg NLL/step:{total_nll / n:.4f}")
+    prec, rec, f1s, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=list(range(n_actions)), zero_division=0,
     )
+    print(f"  {'Bucket':>6}  {'Support':>8}  {'Prec':>6}  {'Rec':>6}  {'F1':>6}")
+    for i, a in enumerate(action_values):
+        print(f"    {a:>3}   {support[i]:>8}  {prec[i]:>6.3f}  {rec[i]:>6.3f}  {f1s[i]:>6.3f}")
 
-    print(f"\n{'Bucket':>8}  {'Support':>8}  {'Precision':>10}  {'Recall':>8}  {'F1':>6}")
-    for i, a in enumerate(actions):
-        print(f"  {a:>5}   {support[i]:>8}  {prec[i]:>10.3f}  {rec[i]:>8.3f}  {f1[i]:>6.3f}")
+
+def save_curves(train_losses, test_losses, train_accs, test_accs, save_dir: Path) -> None:
+    epochs = range(1, len(train_losses) + 1)
+    for name, tr, te in [("loss", train_losses, test_losses),
+                          ("acc", train_accs, test_accs)]:
+        plt.figure()
+        plt.plot(epochs, tr, label="train")
+        plt.plot(epochs, te, label="test")
+        plt.xlabel("Epoch"); plt.ylabel(name); plt.legend(); plt.tight_layout()
+        plt.savefig(save_dir / f"behavioral_rnn_{name}.png", dpi=150)
+        plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Iterative training (extension — NOT Dezfouli)
+# ---------------------------------------------------------------------------
+
+def train_iterative(
+    model: BehavioralRNN,
+    train_seqs: list[np.ndarray],
+    train_tgts: list[np.ndarray],
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    rnn_cfg: dict,
+    training_cfg: dict,
+    device: torch.device,
+) -> float:
+    """Online iterative training over episodes with optional multi-pass.
+
+    This is a departure from Dezfouli's batch training. It trains the model
+    by iterating episode-by-episode, optionally making multiple passes.
+    Grad accumulation is supported for effective larger batch sizes.
+    """
+    it_cfg = training_cfg.get("iterative", {})
+    passes = it_cfg.get("passes", 3)
+    shuffle = it_cfg.get("shuffle_each_pass", True)
+    accum = it_cfg.get("grad_accum_steps", 1)
+    grad_clip = rnn_cfg.get("grad_clip", 1.0)
+
+    model.train()
+    total_loss = 0.0
+    n_examples = len(train_seqs)
+
+    for _ in range(passes):
+        indices = list(range(n_examples))
+        if shuffle:
+            np.random.shuffle(indices)
+
+        optimizer.zero_grad()
+        step_loss = 0.0
+        for step_i, idx in enumerate(indices):
+            seq = torch.tensor(train_seqs[idx], dtype=torch.float32, device=device).unsqueeze(0)
+            tgt = torch.tensor(train_tgts[idx], dtype=torch.long, device=device).unsqueeze(0)
+            logits = model(seq)
+            B, T, A = logits.shape
+            loss = criterion(logits.reshape(B * T, A), tgt.reshape(B * T)) / accum
+            loss.backward()
+            step_loss += loss.item() * accum
+
+            if (step_i + 1) % accum == 0 or step_i == n_examples - 1:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+
+        total_loss += step_loss / n_examples
+
+    return total_loss / passes
 
 
 # ---------------------------------------------------------------------------
@@ -320,23 +300,23 @@ def main() -> None:
 
     data_cfg = cfg["data"]
     rnn_cfg = cfg["behavioral_rnn"]
-    actions: list[int] = rnn_cfg["actions"]
-    endowment: int = data_cfg["original_endowment"]
+    training_cfg = cfg.get("training", {"mode": "batch"})
+    action_values: list[int] = rnn_cfg["action_values"]
+    n_actions: int = rnn_cfg["n_actions"]
     n_rounds: int = data_cfg["original_rounds"]
+    bucketing_rule: str = data_cfg["bucketing_rule"]
 
     df = pd.read_csv(data_cfg["output_path"])
     train_ids, test_ids = split_episodes(df, rnn_cfg["train_frac"], cfg["seed"])
-    print(f"Episodes: {len(train_ids) + len(test_ids)} total, "
+    print(f"Episodes: {len(train_ids)+len(test_ids)} total, "
           f"{len(train_ids)} train, {len(test_ids)} test")
+    print(f"Bucketing rule: {bucketing_rule}")
 
-    train_seqs, train_tgts = encode_episodes(df, train_ids, actions, endowment, n_rounds)
-    test_seqs, test_tgts = encode_episodes(df, test_ids, actions, endowment, n_rounds)
-    print(f"Examples: {len(train_tgts)} train, {len(test_tgts)} test")
+    train_seqs, train_tgts = encode_episodes(df, train_ids, action_values, bucketing_rule, n_rounds)
+    test_seqs, test_tgts = encode_episodes(df, test_ids, action_values, bucketing_rule, n_rounds)
+    print(f"Episodes encoded: {len(train_seqs)} train, {len(test_seqs)} test  "
+          f"(each: {n_rounds} steps × 6-dim input)")
 
-    train_loader = DataLoader(
-        BehavioralDataset(train_seqs, train_tgts),
-        batch_size=rnn_cfg["batch_size"], shuffle=True, collate_fn=collate_fn,
-    )
     test_loader = DataLoader(
         BehavioralDataset(test_seqs, test_tgts),
         batch_size=rnn_cfg["batch_size"], shuffle=False, collate_fn=collate_fn,
@@ -345,64 +325,67 @@ def main() -> None:
     model = BehavioralRNN(
         input_size=rnn_cfg["input_size"],
         hidden_size=rnn_cfg["hidden_size"],
-        n_actions=rnn_cfg["n_actions"],
+        n_actions=n_actions,
         dropout=rnn_cfg["dropout"],
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=rnn_cfg["lr"])
-    if rnn_cfg.get("use_class_weights", True):
-        weights = compute_class_weights(train_tgts, rnn_cfg["n_actions"]).to(device)
-        criterion = nn.CrossEntropyLoss(weight=weights)
-        print("Using class-weighted CrossEntropyLoss")
-    else:
-        criterion = nn.CrossEntropyLoss()
-        print("Using standard CrossEntropyLoss (no class weights)")
+    weights = compute_class_weights(train_tgts, n_actions).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    print("Using class-weighted CrossEntropyLoss")
 
     save_path = Path(rnn_cfg["save_path"])
     save_path.parent.mkdir(parents=True, exist_ok=True)
     best_test_loss = float("inf")
     best_state: dict = {}
-    train_losses, test_losses = [], []
-    train_accs, test_accs = [], []
+    train_losses, test_losses, train_accs, test_accs = [], [], [], []
+
+    training_mode = training_cfg.get("mode", "batch")
 
     for epoch in range(1, rnn_cfg["epochs"] + 1):
-        tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion, rnn_cfg["grad_clip"], device)
+        if training_mode == "batch":
+            train_loader = DataLoader(
+                BehavioralDataset(train_seqs, train_tgts),
+                batch_size=rnn_cfg["batch_size"], shuffle=True, collate_fn=collate_fn,
+            )
+            tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion,
+                                          rnn_cfg["grad_clip"], device)
+        else:
+            tr_loss = train_iterative(model, train_seqs, train_tgts, optimizer, criterion,
+                                      rnn_cfg, training_cfg, device)
+            tr_acc = 0.0  # not computed in iterative mode per-epoch
+
         te_loss, te_acc = eval_epoch(model, test_loader, criterion, device)
-        train_losses.append(tr_loss)
-        test_losses.append(te_loss)
-        train_accs.append(tr_acc)
-        test_accs.append(te_acc)
+        train_losses.append(tr_loss); test_losses.append(te_loss)
+        train_accs.append(tr_acc);  test_accs.append(te_acc)
 
         if te_loss < best_test_loss:
             best_test_loss = te_loss
             best_state = {
                 "model_state_dict": {k: v.cpu().clone() for k, v in model.state_dict().items()},
-                "actions": actions,
                 "input_size": rnn_cfg["input_size"],
                 "hidden_size": rnn_cfg["hidden_size"],
+                "n_actions": n_actions,
+                "dropout": rnn_cfg["dropout"],
+                "action_values": action_values,
+                "bucketing_rule": bucketing_rule,
             }
 
         if epoch % 10 == 0 or epoch == 1:
-            print(
-                f"Epoch {epoch:3d}/{rnn_cfg['epochs']}  "
-                f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.3f}  "
-                f"test_loss={te_loss:.4f}  test_acc={te_acc:.3f}"
-            )
+            print(f"Epoch {epoch:3d}/{rnn_cfg['epochs']}  "
+                  f"train_loss={tr_loss:.4f}  acc={tr_acc:.3f}  "
+                  f"test_loss={te_loss:.4f}  test_acc={te_acc:.3f}")
 
     torch.save(best_state, save_path)
-    print(f"\nBest checkpoint saved to {save_path}  (test_loss={best_test_loss:.4f})")
+    print(f"\nCheckpoint saved → {save_path}  (best test_loss={best_test_loss:.4f})")
 
     ckpt_dir = save_path.parent
     save_curves(train_losses, test_losses, train_accs, test_accs, ckpt_dir)
 
     final_model = load_behavioral_rnn(str(save_path), device=str(device))
     final_loss, final_acc = eval_epoch(final_model, test_loader, criterion, device)
-    print(f"Final test evaluation — loss={final_loss:.4f}  acc={final_acc:.3f}")
-
-    save_predictions(final_model, test_loader, actions, device, ckpt_dir)
-    print(f"Predictions and confusion matrix saved to {ckpt_dir}/")
-
-    print_full_metrics(final_model, test_loader, actions, device)
+    print(f"Final eval — loss={final_loss:.4f}  acc={final_acc:.3f}")
+    print_full_metrics(final_model, test_loader, n_actions, action_values, device)
 
 
 if __name__ == "__main__":

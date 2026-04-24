@@ -1,136 +1,109 @@
-seed: 76
+# ============================================================
+# Dezfouli MRTT + Multi-Agent Extension Config
+# ============================================================
+# LEGEND:
+#   [LOCKED]    Paper spec. Changing breaks Dezfouli N=1 replication.
+#   [FAITHFUL]  Paper value. Safe to change for extensions.
+#   [AMBIGUOUS] Paper unclear; resolved by experiment.
+#   [EXTENSION] Our additions beyond the paper.
+# ============================================================
+
+seed: 42
+
 data:
-  mrtt_dir: data/mrtt
-  train_condition: RND
-  output_path: data/behavioral_rnd_dataset.csv
-  original_endowment: 20
-  original_rounds: 10
-  multiplier: 3
+  mrtt_dir: "data/mrtt"              # [LOCKED] raw Dezfouli CSV root (relative to project root)
+  train_condition: "RND"             # [LOCKED] parse script appends this to mrtt_dir
+  output_path: "data/behavioral_rnd_dataset.csv"
+  original_endowment: 20             # [LOCKED] Dezfouli per-round endowment
+  original_rounds: 10                # [LOCKED] Dezfouli horizon
+  multiplier: 3                      # [LOCKED]
+  bucketing_rule: "paper_range"      # [AMBIGUOUS] "paper_range" | "nearest_neighbor"
+                                     # Paper lists ranges 0-4, 5-8, 9-12, 13-16, 17-20
+                                     # but doesn't say if mapping is by range or nearest center.
+                                     # ~10% of RND labels differ between rules; test both.
+
 behavioral_rnn:
-  hidden_size: 5
-  dropout: 0.2
-  input_size: 4
-  n_actions: 5
-  actions:
-  - 0
-  - 5
-  - 10
-  - 15
-  - 20
-  lr: 0.003
-  epochs: 120
-  batch_size: 64
-  train_frac: 0.8
-  grad_clip: 1.0
-  use_class_weights: yes
-  save_path: checkpoints/behavioral_rnn.pt
-world:
-  communication: yes
-  observation_depth: 4
-investor:
-  learns: yes
-  actions:
-  - 0
-  - 5
-  - 10
-  - 15
-  - 20
-  lr: 0.001
-  epsilon_start: 0.2
-  epsilon_decay: 0.97
+  hidden_size: 5                     # [FAITHFUL] Dezfouli searched {3,5,8,10}; 5 matches Fig 5D
+  dropout: 0.20                      # [FAITHFUL]
+  input_size: 6                      # [LOCKED] prev_action_onehot(5) + prev_repay_prop(1)
+  n_actions: 5                       # [LOCKED]
+  action_values: [0, 5, 10, 15, 20]  # [LOCKED] bucket representatives used at inference
+  prepend_dummy: true                # [LOCKED] zero-vector prepended so round-0 is in the loss
+  lr: 0.003                          # [FAITHFUL]
+  epochs: 120                        # [FAITHFUL]
+  batch_size: 64                     # [FAITHFUL]
+  train_frac: 0.80                   # [FAITHFUL]
+  grad_clip: 1.0                     # [FAITHFUL]
+  save_path: "checkpoints/behavioral_rnn.pt"
+  inference_sample: true             # [FAITHFUL] true=sample from π_t; false=argmax (debug)
+  spillover_alpha: 0.0               # [EXTENSION] Cross-agent trust spillover coefficient
+                                     # 0.0 = independent per-agent trust (Dezfouli baseline)
+                                     # 0.3 = moderate spillover (max supported)
+                                     # h_i <- (1-a)*h_i + a*mean(h_j, j!=i) after each round
+                                     # N=1 guard: spillover never fires at N=1 regardless of alpha
+
+training:
+  mode: "batch"                      # [FAITHFUL] "batch" (Dezfouli) | "iterative" (extension)
+  iterative:                         # [EXTENSION] only used when mode="iterative"
+    passes: 3
+    shuffle_each_pass: true
+    grad_accum_steps: 1
+
+adversary:
+  type: "dqn"                        # [LOCKED]
+  repayment_actions: [0.0, 0.25, 0.50, 0.75, 1.0]  # [LOCKED] fractions of 3*investment
+  hidden_layers: [128, 128]          # [LOCKED] FC architecture per Dezfouli
+  lr: 1.0e-4                         # [FAITHFUL]
+  epsilon_start: 0.2                 # [FAITHFUL]
   epsilon_min: 0.01
-  gamma: 0.95
-  replay_buffer_size: 200000
-  batch_size: 64
-  hidden_layers:
-  - 128
-  - 128
-  target_update_freq: 1000
-  save_name: investor_ql.pt
+  epsilon_decay: 0.9999
+  gamma: 0.99                        # [FAITHFUL]
+  replay_buffer_size: 400000         # [FAITHFUL]
+  batch_size: 64                     # [FAITHFUL]
+  target_update_freq: 1000           # [FAITHFUL]
+  training_episodes: 200000          # [FAITHFUL]
+  eval_interval: 10000
+  eval_episodes: 2000
+  save_dir: "checkpoints/"
+  mode: "independent_q_learning"     # [EXTENSION] only IQL supported; CTDE is future work
+
 game:
-  max_rounds: 10000
-  endowment: 10000
-  multiplier: 3
-  min_investment: 0
-agents:
-- name: fair_1
-  policy: fair
-  repayment_actions:
-  - 0.0
-  - 0.05
-  - 0.1
-  - 0.15
-  - 0.2
-  - 0.25
-  - 0.3
-  - 0.35
-  - 0.4
-  - 0.45
-  - 0.5
-  - 0.55
-  - 0.6
-  - 0.65
-  - 0.7
-  - 0.75
-  - 0.8
-  - 0.85
-  - 0.9
-  - 0.95
-  - 1.0
-- name: max_1
-  policy: max
-  repayment_actions:
-  - 0.0
-  - 0.05
-  - 0.1
-  - 0.15
-  - 0.2
-  - 0.25
-  - 0.3
-  - 0.35
-  - 0.4
-  - 0.45
-  - 0.5
-  - 0.55
-  - 0.6
-  - 0.65
-  - 0.7
-  - 0.75
-  - 0.8
-  - 0.85
-  - 0.9
-  - 0.95
-  - 1.0
-dqn:
-  repayment_actions:
-  - 0.0
-  - 0.25
-  - 0.5
-  - 0.75
-  - 1.0
-  hidden_layers:
-  - 128
-  - 128
-  lr: 0.001
-  epsilon_start: 0.2
-  epsilon_decay: 0.97
-  epsilon_min: 0.01
-  gamma: 0.95
-  replay_buffer_size: 400000
-  batch_size: 64
-  target_update_freq: 1000
-  training_episodes: 100
-  training_rounds: 10000
-  eval_interval: 10
-  eval_episodes: 5
-live_simulation:
-  enabled: yes
-  rounds: 10000
-  use_pretrained: yes
-  epsilon: 0.1
-checkpoints:
-  base_dir: checkpoints
+  # Agent list. Order defines config-index tie-breaker for trust-ranked allocation.
+  # N=1 (Dezfouli replication): one agent. N>=2: multi-agent extension.
+  agents:                            # [EXTENSION] Paper has N=1
+    - name: max_1
+      type: max
+      save_path: "checkpoints/adversary_max_1.pt"
+  # Two-agent example (comment out above, uncomment below):
+  # agents:
+  #   - name: max_1
+  #     type: max
+  #     save_path: "checkpoints/adversary_{condition}_max_1.pt"
+  #   - name: fair_1
+  #     type: fair
+  #     save_path: "checkpoints/adversary_{condition}_fair_1.pt"
+
+  max_rounds: 10                     # [LOCKED for replication]
+  endowment_per_agent: 20            # [LOCKED for replication] per-agent share of wallet
+                                     # Effective wallet = endowment_per_agent * num_agents
+                                     # At N=1: wallet=20 (Dezfouli identical)
+                                     # At N=2: wallet=40 (Test B, no budget competition)
+  multiplier: 3                      # [LOCKED]
+  min_investment: 0                  # [FAITHFUL]
+
+  # Trust-ranked sequential allocation (D3)
+  allocation_rule: "trust_ranked"    # [EXTENSION] sort by desired desc, fill greedily
+  tiebreaker: "config_order"         # [EXTENSION] lower config-list index wins ties
+  clip_rounding: "down"              # [EXTENSION] clipped alloc rounds DOWN to nearest bucket
+
+  # Observation window for W1 adversary state (multi-agent extension)
+  observation_depth: 4               # [EXTENSION] last-d-round window; irrelevant at N=1
+
+world:
+  mode: 0                            # [EXTENSION] 0=W0 (independent), 1=W1 (others visible)
+                                     # At N=1, W0 and W1 produce identical adversary state.
+
 export:
-  output_dir: outputs/
-  filename: game_log.csv
-  json_log_interval: 1
+  output_dir: "outputs/"
+  filename: "game_log.csv"
+  json_log_interval: 1               # [LOCKED] per-row hidden-state / observation logging

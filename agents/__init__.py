@@ -1,47 +1,39 @@
-"""Agent factory: creates agents from config entries.
+"""Agent factory: creates adversary agents from config.
 
-Usage:
-    agents = create_all_agents(config, state_dim, run_id="w0_20260404_153022")
+State dimension formula:
+  base = rnn_hidden(5) + policy_vec(5) + investor_action_onehot(5) + round_norm(1) = 16
+  W1/N>1 extension = world.others_obs_dim()
+  total = base + others_obs_dim
 """
 
 from agents.adversary import DQNAdversary
 from agents.base import BaseAgent
 from agents.random_agent import RandomAgent
+from world import World
 
 
-def create_agent(
-    agent_cfg: dict,
-    full_config: dict,
-    state_dim: int,
-    run_id: str | None = None,
-) -> BaseAgent:
-    """Create a single agent from its config entry."""
-    policy = agent_cfg["policy"]
+def compute_state_dim(config: dict, world: World) -> int:
+    """Compute adversary state dimension: 16 base + others_obs extension."""
+    rnn_hidden = config["behavioral_rnn"]["hidden_size"]
+    n_actions = config["behavioral_rnn"]["n_actions"]
+    # rnn_hidden + policy_vec + action_onehot + round_norm
+    base = rnn_hidden + n_actions + n_actions + 1
+    return base + world.others_obs_dim()
+
+
+def create_agent(agent_cfg: dict, full_config: dict, state_dim: int) -> BaseAgent:
+    agent_type = agent_cfg["type"]
     name = agent_cfg["name"]
-
-    if policy == "random":
-        return RandomAgent(name, agent_cfg, full_config)
-    elif policy in ("max", "fair"):
-        repayment_actions = agent_cfg.get(
-            "repayment_actions",
-            full_config["dqn"].get("repayment_actions", [0.0, 0.25, 0.5, 0.75, 1.0]),
-        )
-        num_actions = len(repayment_actions)
-        return DQNAdversary(
-            name, policy, agent_cfg, full_config,
-            state_dim, num_actions, run_id=run_id,
-        )
+    if agent_type == "random":
+        return RandomAgent(name, "random", full_config)
+    elif agent_type in ("max", "fair"):
+        return DQNAdversary(name, agent_type, full_config, state_dim)
     else:
-        raise ValueError(f"Unknown policy: {policy}")
+        raise ValueError(f"Unknown agent type: {agent_type!r}")
 
 
-def create_all_agents(
-    full_config: dict,
-    state_dim: int,
-    run_id: str | None = None,
-) -> list[BaseAgent]:
-    """Create all agents from config['agents'] list."""
+def create_all_agents(config: dict, state_dim: int) -> list[BaseAgent]:
     return [
-        create_agent(cfg, full_config, state_dim, run_id=run_id)
-        for cfg in full_config["agents"]
+        create_agent(a_cfg, config, state_dim)
+        for a_cfg in config["game"]["agents"]
     ]
