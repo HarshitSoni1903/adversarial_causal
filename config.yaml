@@ -41,7 +41,11 @@ behavioral_rnn:
                                      # 0.3 = moderate spillover (max supported)
                                      # h_i <- (1-a)*h_i + a*mean(h_j, j!=i) after each round
                                      # N=1 guard: spillover never fires at N=1 regardless of alpha
-
+  trust_decay: 1                     # [EXTENSION] Inference-time hidden-state decay γ ∈ (0, 1].
+                                     # Applied as h ← γ·h before each simulation GRU step.
+                                     # 1.0 = Dezfouli-faithful (no decay).
+                                     # 0.7–0.8 = recent rounds weighted more; trust responds
+                                     # to cheating faster. RNN training always uses γ=1.0.
 training:
   mode: "batch"                      # [FAITHFUL] "batch" (Dezfouli) | "iterative" (extension)
   iterative:                         # [EXTENSION] only used when mode="iterative"
@@ -100,7 +104,7 @@ game:
   observation_depth: 4               # [EXTENSION] last-d-round window; irrelevant at N=1
 
 world:
-  mode: 0                            # [EXTENSION] 0=W0 (independent), 1=W1 (others visible)
+  mode: 1                            # [EXTENSION] 0=W0 (independent), 1=W1 (others visible)
                                      # At N=1, W0 and W1 produce identical adversary state.
 
 export:

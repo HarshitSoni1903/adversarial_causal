@@ -30,6 +30,11 @@ class RNNInvestor:
         self.action_values: list[int] = rnn_cfg["action_values"]
         self.n_actions: int = rnn_cfg["n_actions"]
         self.inference_sample: bool = rnn_cfg.get("inference_sample", True)
+        self.trust_decay: float = float(rnn_cfg.get("trust_decay", 1.0))
+        if not (0.0 < self.trust_decay <= 1.0):
+            raise ValueError(
+                f"trust_decay must be in (0, 1], got {self.trust_decay}"
+            )
         self.bucketing_rule: str = config["data"]["bucketing_rule"]
         self.agent_names = agent_names
 
@@ -56,7 +61,13 @@ class RNNInvestor:
             self._action_onehot[name] = np.zeros(self.n_actions, dtype=np.float32)
 
     def act(self, agent_name: str) -> float:
-        """Run one GRU step, sample action, cache state info. Returns desired investment."""
+        """Run one GRU step, sample action, cache state info. Returns desired investment.
+
+        Applies trust decay h ← γ·h before the GRU step. At t=0, h is zeros
+        so decay is a no-op. γ=1.0 recovers Dezfouli behavior exactly.
+        """
+        if self.trust_decay < 1.0:
+            self._h[agent_name] = self._h[agent_name] * self.trust_decay
         h_new, policy_vec = self.model.step_forward(
             self._h[agent_name],
             self._prev_ah[agent_name].to(self.device),
