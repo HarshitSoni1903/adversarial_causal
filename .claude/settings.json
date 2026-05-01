@@ -9,7 +9,12 @@
       "Bash(python3 main.py --smoke-test)",
       "Bash(python main.py --smoke-test)",
       "Bash(python main.py --experiment-matrix)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python3 -)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('run_gamma_sweep.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python3 run_gamma_sweep.py)",
+      "Bash(tee outputs/gamma_sweep_console.log)",
+      "Bash(tee outputs/gamma_seed_sweep_console.log)"
     ]
   }
 }

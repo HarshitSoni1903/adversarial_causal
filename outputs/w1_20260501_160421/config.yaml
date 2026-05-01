@@ -27,7 +27,7 @@ behavioral_rnn:
   save_path: checkpoints/behavioral_rnn.pt
   inference_sample: true
   spillover_alpha: 0.0
-  trust_decay: 0.9
+  trust_decay: 0.7
 training:
   mode: batch
   iterative:
@@ -63,10 +63,10 @@ game:
   agents:
   - name: fair_1
     type: fair
-    save_path: checkpoints/sweep_g090_w1_fair_1.pt
+    save_path: checkpoints/sweep_g070_w1_fair_1.pt
   - name: max_1
     type: max
-    save_path: checkpoints/sweep_g090_w1_max_1.pt
+    save_path: checkpoints/sweep_g070_w1_max_1.pt
   max_rounds: 10
   endowment_per_agent: 20
   multiplier: 3

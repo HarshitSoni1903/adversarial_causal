@@ -1,0 +1,18 @@
+
+============================================================
+TRAINING COMPLETE
+============================================================
+  Run ID:     w1_20260501_160906
+  World:      W1 (communication)
+  Episodes:   50000
+  Epsilon:    0.0100
+
+  Last 100 episodes (mean):
+    Investor: +23
+    fair_1 (fair): +99
+    max_1 (max): +180
+
+  Last eval (ep 50000):
+    Wealth: 61
+    fair_1: reward=+94  repay=0.65
+    max_1: reward=+196  repay=0.11

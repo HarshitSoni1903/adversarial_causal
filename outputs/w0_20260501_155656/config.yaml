@@ -63,10 +63,10 @@ game:
   agents:
   - name: fair_1
     type: fair
-    save_path: checkpoints/sweep_g090_w1_fair_1.pt
+    save_path: checkpoints/sweep_g090_w0_fair_1.pt
   - name: max_1
     type: max
-    save_path: checkpoints/sweep_g090_w1_max_1.pt
+    save_path: checkpoints/sweep_g090_w0_max_1.pt
   max_rounds: 10
   endowment_per_agent: 20
   multiplier: 3
@@ -76,7 +76,7 @@ game:
   clip_rounding: down
   observation_depth: 4
 world:
-  mode: 1
+  mode: 0
 export:
   output_dir: outputs/
   filename: game_log.csv
