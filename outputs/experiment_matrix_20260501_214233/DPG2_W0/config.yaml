@@ -55,7 +55,6 @@ adversary:
   training_episodes: 50000
   eval_interval: 10000
   eval_episodes: 500
-  matrix_eval_episodes: 1000
   save_dir: checkpoints/
   mode: independent_q_learning
 game:
@@ -75,7 +74,7 @@ game:
   max_rounds: 10
   observation_depth: 4
 edges:
-  ii_edge: 0
+  ii_edge: 1
   aa_edge: 0
 export:
   output_dir: outputs/

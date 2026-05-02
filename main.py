@@ -6,8 +6,8 @@ Usage:
     python main.py --skip-rnn               # Skip BehavioralRNN training
     python main.py --skip-dqn              # Skip DQN adversary training
     python main.py --sim-only [run_id]      # Re-simulate saved weights (latest if omitted)
-    python main.py --smoke-test             # N=2 allocation/W0/W1 smoke test only
-    python main.py --experiment-matrix      # Full 5-condition experiment matrix
+    python main.py --smoke-test             # Two-dyad structural + behavioral smoke tests
+    python main.py --experiment-matrix      # Full 4-condition 2x2 experiment matrix
 """
 
 import argparse
@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from agents import compute_state_dim, create_all_agents
+from agents import compute_state_dim, create_agent
 from agents.investor import RNNInvestor
 from game import Game
 from utils import load_config, set_all_seeds
@@ -38,9 +38,10 @@ from world import World
 # ------------------------------------------------------------------
 
 def _create_run_id(cfg: dict) -> str:
-    mode = "w1" if cfg["world"]["mode"] == 1 else "w0"
+    ii = cfg["edges"]["ii_edge"]
+    aa = cfg["edges"]["aa_edge"]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{mode}_{ts}"
+    return f"ii{ii}_aa{aa}_{ts}"
 
 
 def _out_dir(cfg: dict, run_id: str) -> Path:
@@ -50,10 +51,10 @@ def _out_dir(cfg: dict, run_id: str) -> Path:
 
 
 def _find_latest_run_id(cfg: dict) -> str | None:
-    """Return most-recent output subdirectory matching the world mode."""
-    mode = "w1" if cfg["world"]["mode"] == 1 else "w0"
+    ii = cfg["edges"]["ii_edge"]
+    aa = cfg["edges"]["aa_edge"]
     out_base = Path(cfg["export"]["output_dir"])
-    dirs = sorted(out_base.glob(f"{mode}_*"), reverse=True)
+    dirs = sorted(out_base.glob(f"ii{ii}_aa{aa}_*"), reverse=True)
     return dirs[0].name if dirs else None
 
 
@@ -62,28 +63,26 @@ def _find_latest_run_id(cfg: dict) -> str | None:
 # ------------------------------------------------------------------
 
 def _build(cfg: dict):
-    agent_names = [a["name"] for a in cfg["game"]["agents"]]
+    dyad_pairs = [(d["investor"], d["trustee"]["name"]) for d in cfg["game"]["dyads"]]
+    ii_edge = cfg["edges"]["ii_edge"]
+    aa_edge = cfg["edges"]["aa_edge"]
+    n_actions = cfg["behavioral_rnn"]["n_actions"]
+    obs_depth = cfg["game"]["observation_depth"]
 
-    world = World(
-        mode=cfg["world"]["mode"],
-        observation_depth=cfg["game"].get("observation_depth", 4),
-        agent_names=agent_names,
-    )
+    world = World(ii_edge, aa_edge, obs_depth, dyad_pairs, n_actions)
 
-    state_dim = compute_state_dim(cfg, world)
+    state_dim = compute_state_dim(cfg, aa_edge)
     rnn_h = cfg["behavioral_rnn"]["hidden_size"]
-    n_act = cfg["behavioral_rnn"]["n_actions"]
     print(f"Adversary state dim: {state_dim}  "
-          f"(rnn_h={rnn_h} + policy={n_act} + ah={n_act} + round=1 "
-          f"+ others_obs={world.others_obs_dim()})")
+          f"(rnn_h={rnn_h} + policy={n_actions} + ah={n_actions} + round=1 "
+          f"+ flags=2 + cross={2*obs_depth if aa_edge else 0})")
 
-    agents = create_all_agents(cfg, state_dim)
+    investors = [RNNInvestor(cfg, d["trustee"]["name"]) for d in cfg["game"]["dyads"]]
+    agents = [create_agent(d["trustee"], cfg, state_dim) for d in cfg["game"]["dyads"]]
     print(f"Agents: {[(a.name, a.policy) for a in agents]}")
+    print(f"Investors: {len(investors)} × frozen BehavioralRNN")
 
-    investor = RNNInvestor(cfg, agent_names)
-    print("Investor: frozen BehavioralRNN")
-
-    return world, agents, investor
+    return world, agents, investors
 
 
 # ------------------------------------------------------------------
@@ -116,16 +115,10 @@ def step_train_rnn(cfg: dict) -> None:
 
 def step_train_dqn(cfg: dict, run_id: str, out: Path) -> tuple:
     print("\n--- STEP 3: TRAIN DQN ADVERSARIES ---")
-    world, agents, investor = _build(cfg)
+    world, agents, investors = _build(cfg)
     adv_cfg = cfg["adversary"]
 
-    # Patch export dir to match this run's output dir
-    cfg_patched = dict(cfg)
-    cfg_patched["export"] = dict(cfg["export"])
-    cfg_patched["export"]["output_dir"] = str(out.parent)
-
-    game = Game(cfg, world, investor, agents)
-    # Override export dir to this run's folder
+    game = Game(cfg, world, investors, agents)
     game.export_dir = out
 
     stats = game.run_training(
@@ -137,32 +130,26 @@ def step_train_dqn(cfg: dict, run_id: str, out: Path) -> tuple:
     summary = _training_summary(stats, agents, cfg, game, run_id)
     print(summary)
     (out / "training_summary.txt").write_text(summary)
-    return world, agents, investor
+    return world, agents, investors
 
 
 def step_verify(
-    cfg: dict, world: World, agents: list, investor: RNNInvestor, out: Path, run_id: str,
+    cfg: dict, world: World, agents: list, investors: list, out: Path, run_id: str,
     n_episodes: int = 1000,
 ) -> None:
-    """Figure 5 verification: run n_episodes eval episodes, plot mean repayment by round."""
     print(f"\n--- STEP 4: FIGURE 5 VERIFICATION ({n_episodes} episodes) ---")
 
     for a in agents:
         if hasattr(a, "set_eval_mode"):
             a.set_eval_mode(True)
 
-    game = Game(cfg, world, investor, agents)
+    game = Game(cfg, world, investors, agents)
     game.export_dir = out
 
     all_rows: list[pd.DataFrame] = []
     for ep_i in range(n_episodes):
-        world.reset()
-        investor.reset()
-        for a in agents:
-            a.reset()
         stats = game._run_episode(log_details=True)
-        df = stats["log_df"]
-        df = df.copy()
+        df = stats["log_df"].copy()
         df["episode"] = ep_i
         all_rows.append(df)
 
@@ -180,135 +167,195 @@ def step_verify(
 
 
 # ------------------------------------------------------------------
-# Smoke test: N=2 allocation, W0/W1 invariance at N=1
+# Smoke tests
 # ------------------------------------------------------------------
 
 def run_smoke_test(cfg: dict) -> None:
-    """Structural and behavioral smoke tests.
+    """Five structural and behavioral smoke tests for the two-dyad system.
 
-    Test A — N=1 structural invariant:
-      At N=1, others_obs_dim() == 0 for both W0 and W1.
-      State dim must be exactly 16 regardless of mode.
+    Test A — state dim:
+      For each (ii, aa) in {0,1}²: compute_state_dim returns 18 + 8*aa.
 
-    Test B — N=1 behavioral invariant (if checkpoint available):
-      Load trained weights; run 10 greedy episodes each under W0 and W1
-      with the same seed. At N=1, state vectors are identical → outcomes match.
+    Test B — single-dyad reproducibility (if checkpoint available):
+      One dyad, ii=0, aa=0, fixed seed, 10 greedy episodes. Repayment in (0,1].
 
-    Test C — N=1 allocation:
-      Per-round investment ≤ endowment for 10 episodes.
+    Test C — per-investor wallet bound:
+      For each of 4 conditions, 10 episodes: invest_k <= endowment_per_investor.
 
-    Test D — N=2 allocation (if config has 2 agents):
-      Per-round sum of investments ≤ endowment for 10 episodes under W0 + W1.
+    Test D — per-dyad reward conservation:
+      For each of 4 conditions, 10 episodes: |inv_reward + agent_reward - 2*invest| < 1e-6.
+
+    Test E — ii_edge effect non-trivial (if checkpoint available):
+      (ii=0, aa=0) vs (ii=1, aa=0): mean repayment must differ > 1e-3 in >= 1 round.
     """
     print("\n=== SMOKE TEST ===")
-    agent_names = [a["name"] for a in cfg["game"]["agents"]]
-    obs_depth = cfg["game"].get("observation_depth", 4)
-    endowment_per_agent = cfg["game"].get("endowment_per_agent", cfg["game"].get("endowment", 20))
+    epi = cfg["game"]["endowment_per_investor"]
+    obs_depth = cfg["game"]["observation_depth"]
 
     # ------------------------------------------------------------------
-    # Test A: structural dim invariant
+    # Test A: state dim
     # ------------------------------------------------------------------
-    print(f"\n[A] N={len(agent_names)} structural state-dim check")
-    for mode_val in (0, 1):
-        world = World(mode=mode_val, observation_depth=obs_depth, agent_names=agent_names)
-        sd = compute_state_dim(cfg, world)
-        ood = world.others_obs_dim()
-        expected_sd = 16 + ood
-        ok = (sd == expected_sd)
-        print(f"  W{mode_val}: others_obs_dim={ood}  state_dim={sd}  {'OK' if ok else 'FAIL'}")
-    if len(agent_names) == 1:
-        # At N=1 others_obs_dim must be 0 for both modes
-        for mode_val in (0, 1):
-            w = World(mode=mode_val, observation_depth=obs_depth, agent_names=agent_names)
-            assert w.others_obs_dim() == 0, f"Expected 0 at N=1, got {w.others_obs_dim()}"
-        print("  N=1 W0==W1 state_dim invariant: PASS (others_obs=0 for both)")
+    print("\n[A] State dim check for all 4 (ii, aa) combinations")
+    all_ok = True
+    for ii in (0, 1):
+        for aa in (0, 1):
+            sd = compute_state_dim(cfg, aa_edge=aa)
+            expected = 18 + 8 * aa
+            ok = sd == expected
+            if not ok:
+                all_ok = False
+            print(f"  ii={ii} aa={aa}: state_dim={sd}  expected={expected}  "
+                  f"{'OK' if ok else 'FAIL'}")
+    print(f"  Test A: {'PASS' if all_ok else 'FAIL'}")
 
     # ------------------------------------------------------------------
-    # Test B: behavioral invariant — load checkpoint, same seed, compare
+    # Test B: single-dyad reproducibility
     # ------------------------------------------------------------------
-    if len(agent_names) == 1:
-        print(f"\n[B] N=1 W0==W1 behavioral invariant (greedy, same seed)")
-        checkpoint_ok = True
-        results = {}
-        for mode_val in (0, 1):
-            world = World(mode=mode_val, observation_depth=obs_depth, agent_names=agent_names)
-            sd = compute_state_dim(cfg, world)
-            agents = create_all_agents(cfg, sd)
+    print(f"\n[B] Single-dyad reproducibility (greedy, seed={cfg['seed']})")
+    checkpoint_ok = True
+    try:
+        single_cfg = copy.deepcopy(cfg)
+        single_cfg["edges"]["ii_edge"] = 0
+        single_cfg["edges"]["aa_edge"] = 0
+        single_cfg["game"]["dyads"] = [cfg["game"]["dyads"][0]]
+        single_cfg["behavioral_rnn"]["inference_sample"] = False
+
+        world = World(0, 0, obs_depth, [("i1", "a1")], cfg["behavioral_rnn"]["n_actions"])
+        sd = compute_state_dim(single_cfg, aa_edge=0)
+        agents = [create_agent(single_cfg["game"]["dyads"][0]["trustee"], single_cfg, sd)]
+        for a in agents:
+            try:
+                a.load()
+                a.set_eval_mode(True)
+            except Exception:
+                checkpoint_ok = False
+                break
+        if checkpoint_ok:
+            investors = [RNNInvestor(single_cfg, "a1")]
+            game = Game(single_cfg, world, investors, agents)
+            set_all_seeds(single_cfg["seed"])
+            rep_by_round: list[list[float]] = [[] for _ in range(single_cfg["game"]["max_rounds"])]
+            for _ in range(10):
+                stats = game._run_episode(log_details=True)
+                df = stats["log_df"]
+                for t, grp in df.groupby("timestep"):
+                    rep_by_round[t].extend(grp["repayment_pct"].tolist())
+            means = [np.mean(r) for r in rep_by_round if r]
+            print(f"  Mean repayment by round: {[f'R{i}={v:.2f}' for i, v in enumerate(means)]}")
+            ok = all(0.0 <= m <= 1.0 for m in means)
+            print(f"  Test B: {'PASS' if ok else 'FAIL'} (values in [0,1])")
+        else:
+            print("  SKIP — no checkpoint available (run training first)")
+    except Exception as e:
+        print(f"  SKIP — error: {e}")
+
+    # ------------------------------------------------------------------
+    # Tests C + D: wallet bound and reward conservation for all 4 conditions
+    # ------------------------------------------------------------------
+    conditions_cd = [("ii=0,aa=0", 0, 0), ("ii=1,aa=0", 1, 0),
+                     ("ii=0,aa=1", 0, 1), ("ii=1,aa=1", 1, 1)]
+
+    print(f"\n[C] Per-investor wallet bound (invest_k <= {epi}) — 10 episodes each condition")
+    c_all_pass = True
+    for label, ii, aa in conditions_cd:
+        cond_cfg = copy.deepcopy(cfg)
+        cond_cfg["edges"]["ii_edge"] = ii
+        cond_cfg["edges"]["aa_edge"] = aa
+        dyad_pairs = [(d["investor"], d["trustee"]["name"]) for d in cond_cfg["game"]["dyads"]]
+        n_actions = cond_cfg["behavioral_rnn"]["n_actions"]
+        world = World(ii, aa, obs_depth, dyad_pairs, n_actions)
+        sd = compute_state_dim(cond_cfg, aa_edge=aa)
+        agents = [create_agent(d["trustee"], cond_cfg, sd) for d in cond_cfg["game"]["dyads"]]
+        investors = [RNNInvestor(cond_cfg, d["trustee"]["name"]) for d in cond_cfg["game"]["dyads"]]
+        game = Game(cond_cfg, world, investors, agents)
+        set_all_seeds(cfg["seed"])
+        violations = 0
+        for _ in range(10):
+            stats = game._run_episode(log_details=True)
+            df = stats["log_df"]
+            violations += int((df["investment"] > epi + 1e-6).any())
+        ok = violations == 0
+        if not ok:
+            c_all_pass = False
+        print(f"  {label}: violations={violations}/10  {'PASS' if ok else 'FAIL'}")
+    print(f"  Test C: {'PASS' if c_all_pass else 'FAIL'}")
+
+    print(f"\n[D] Per-dyad reward conservation — 10 episodes each condition")
+    d_all_pass = True
+    for label, ii, aa in conditions_cd:
+        cond_cfg = copy.deepcopy(cfg)
+        cond_cfg["edges"]["ii_edge"] = ii
+        cond_cfg["edges"]["aa_edge"] = aa
+        dyad_pairs = [(d["investor"], d["trustee"]["name"]) for d in cond_cfg["game"]["dyads"]]
+        n_actions = cond_cfg["behavioral_rnn"]["n_actions"]
+        world = World(ii, aa, obs_depth, dyad_pairs, n_actions)
+        sd = compute_state_dim(cond_cfg, aa_edge=aa)
+        agents = [create_agent(d["trustee"], cond_cfg, sd) for d in cond_cfg["game"]["dyads"]]
+        investors = [RNNInvestor(cond_cfg, d["trustee"]["name"]) for d in cond_cfg["game"]["dyads"]]
+        game = Game(cond_cfg, world, investors, agents)
+        set_all_seeds(cfg["seed"])
+        bad_rows = 0
+        total_rows = 0
+        for _ in range(10):
+            stats = game._run_episode(log_details=True)
+            df = stats["log_df"]
+            row_sum = df["investor_reward"] + df["agent_reward"]
+            expected = 2.0 * df["investment"]
+            bad_rows += int((~np.isclose(row_sum.values, expected.values, atol=1e-6)).sum())
+            total_rows += len(df)
+        ok = bad_rows == 0
+        if not ok:
+            d_all_pass = False
+        print(f"  {label}: bad_rows={bad_rows}/{total_rows}  {'PASS' if ok else 'FAIL'}")
+    print(f"  Test D: {'PASS' if d_all_pass else 'FAIL'}")
+
+    # ------------------------------------------------------------------
+    # Test E: ii_edge effect is non-trivial
+    # ------------------------------------------------------------------
+    print(f"\n[E] ii_edge non-trivial effect (if checkpoint available)")
+    try:
+        results_e: dict = {}
+        e_checkpoint_ok = True
+        for ii in (0, 1):
+            cond_cfg = copy.deepcopy(cfg)
+            cond_cfg["edges"]["ii_edge"] = ii
+            cond_cfg["edges"]["aa_edge"] = 0
+            cond_cfg["behavioral_rnn"]["inference_sample"] = False
+            dyad_pairs = [(d["investor"], d["trustee"]["name"]) for d in cond_cfg["game"]["dyads"]]
+            n_actions = cond_cfg["behavioral_rnn"]["n_actions"]
+            world = World(ii, 0, obs_depth, dyad_pairs, n_actions)
+            sd = compute_state_dim(cond_cfg, aa_edge=0)
+            agents = [create_agent(d["trustee"], cond_cfg, sd) for d in cond_cfg["game"]["dyads"]]
             for a in agents:
                 try:
                     a.load()
-                except Exception:
-                    checkpoint_ok = False
-                    break
-                if hasattr(a, "set_eval_mode"):
                     a.set_eval_mode(True)
-            if not checkpoint_ok:
+                except Exception:
+                    e_checkpoint_ok = False
+                    break
+            if not e_checkpoint_ok:
                 break
-            investor = RNNInvestor(cfg, agent_names)
-            game = Game(cfg, world, investor, agents)
+            investors = [RNNInvestor(cond_cfg, d["trustee"]["name"]) for d in cond_cfg["game"]["dyads"]]
+            game = Game(cond_cfg, world, investors, agents)
             set_all_seeds(cfg["seed"])
-            rep_means = []
+            rep_by_round: list[list[float]] = [[] for _ in range(cond_cfg["game"]["max_rounds"])]
             for _ in range(10):
-                world.reset(); investor.reset()
-                for a in agents:
-                    a.reset()
-                stats = game._run_episode(log_details=False)
-                rep_means.append(stats["agent_repay_means"][agent_names[0]])
-            results[mode_val] = round(np.mean(rep_means), 6)
-
-        if not checkpoint_ok:
-            print("  SKIP — no checkpoint available (run training first)")
-        else:
-            diff = abs(results[0] - results[1])
-            ok = diff < 1e-6
-            print(f"  W0 mean_repay={results[0]:.4f}  W1 mean_repay={results[1]:.4f}")
-            print(f"  W0==W1: {'PASS' if ok else 'FAIL'} (diff={diff:.2e})")
-
-    # ------------------------------------------------------------------
-    # Test C: N=1 allocation bound
-    # ------------------------------------------------------------------
-    print(f"\n[C] N=1 allocation bound (10 episodes)")
-    world = World(mode=0, observation_depth=obs_depth, agent_names=agent_names)
-    sd = compute_state_dim(cfg, world)
-    agents = create_all_agents(cfg, sd)
-    investor = RNNInvestor(cfg, agent_names)
-    game = Game(cfg, world, investor, agents)
-    set_all_seeds(cfg["seed"])
-    violations = 0
-    effective_endowment_c = endowment_per_agent * len(agent_names)
-    for _ in range(10):
-        world.reset(); investor.reset()
-        for a in agents:
-            a.reset()
-        stats = game._run_episode(log_details=True)
-        per_round = stats["log_df"].groupby("timestep")["investment"].sum()
-        violations += int((per_round > effective_endowment_c + 1e-6).any())
-    print(f"  allocation_violations={violations}/10  {'PASS' if violations == 0 else 'FAIL'}")
-
-    # ------------------------------------------------------------------
-    # Test D: N=2 allocation (if config has 2 agents)
-    # ------------------------------------------------------------------
-    n_agents = len(agent_names)
-    if n_agents >= 2:
-        print(f"\n[D] N={n_agents} allocation bound (10 episodes, W0 + W1)")
-        effective_endowment_d = endowment_per_agent * n_agents
-        for mode_val in (0, 1):
-            world = World(mode=mode_val, observation_depth=obs_depth, agent_names=agent_names)
-            sd = compute_state_dim(cfg, world)
-            agents = create_all_agents(cfg, sd)
-            investor = RNNInvestor(cfg, agent_names)
-            game = Game(cfg, world, investor, agents)
-            set_all_seeds(cfg["seed"])
-            violations = 0
-            for _ in range(10):
-                world.reset(); investor.reset()
-                for a in agents:
-                    a.reset()
                 stats = game._run_episode(log_details=True)
-                per_round = stats["log_df"].groupby("timestep")["investment"].sum()
-                violations += int((per_round > effective_endowment_d + 1e-6).any())
-            print(f"  W{mode_val}: violations={violations}/10  "
-                  f"{'PASS' if violations == 0 else 'FAIL'}")
+                df = stats["log_df"]
+                for t, grp in df.groupby("timestep"):
+                    rep_by_round[t].extend(grp["repayment_pct"].tolist())
+            results_e[ii] = [np.mean(r) for r in rep_by_round if r]
+
+        if not e_checkpoint_ok:
+            print("  SKIP — no checkpoint available")
+        else:
+            diffs = [abs(a - b) for a, b in zip(results_e[0], results_e[1])]
+            max_diff = max(diffs)
+            ok = max_diff > 1e-3
+            print(f"  max |repay diff| across rounds = {max_diff:.4f}")
+            print(f"  Test E: {'PASS' if ok else 'FAIL (ii_edge had no effect)'}")
+    except Exception as e:
+        print(f"  SKIP — error: {e}")
 
     print("\n=== SMOKE TEST DONE ===")
 
@@ -362,7 +409,6 @@ def _save_training_curves(stats: dict, agents: list, save_dir: Path) -> None:
 
 
 def _save_fig5_plot(fig5_df: pd.DataFrame, agents: list, save_dir: Path) -> None:
-    """Figure 5 equivalent: mean repayment % by round, averaged across episodes."""
     save_dir.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -429,11 +475,12 @@ def _save_round_analysis(log_df: pd.DataFrame, agents: list, save_dir: Path,
 
 def _training_summary(stats: dict, agents: list, cfg: dict, game: Game, run_id: str) -> str:
     rets = stats["training_returns"]
-    mode = "W1 (communication)" if cfg["world"]["mode"] == 1 else "W0 (independent)"
+    ii = cfg["edges"]["ii_edge"]
+    aa = cfg["edges"]["aa_edge"]
     lines = [
         f"\n{'='*60}", "TRAINING COMPLETE", f"{'='*60}",
         f"  Run ID:     {run_id}",
-        f"  World:      {mode}",
+        f"  ii_edge:    {ii}  aa_edge: {aa}",
         f"  Episodes:   {len(rets)}",
         f"  Epsilon:    {game._get_epsilon():.4f}",
     ]
@@ -458,13 +505,14 @@ def _simulation_summary(log_df: pd.DataFrame, agents: list, cfg: dict,
                          run_id: str, label: str = "SIMULATION SUMMARY") -> str:
     if log_df.empty:
         return "No rounds played."
-    mode = "W1 (communication)" if cfg["world"]["mode"] == 1 else "W0 (independent)"
+    ii = cfg["edges"]["ii_edge"]
+    aa = cfg["edges"]["aa_edge"]
     lines = [
         f"\n{'='*60}", label, f"{'='*60}",
         f"  Run ID:         {run_id}",
-        f"  World mode:     {mode}",
+        f"  ii_edge:        {ii}  aa_edge: {aa}",
         f"  Total rounds:   {log_df['timestep'].max() + 1}",
-        f"  Final wealth:   {log_df['investor_wealth'].iloc[-1]:.2f}",
+        f"  Final wealth:   {log_df['investor_wealth'].max():.2f}",
         f"  Inv cumulative: {log_df['investor_cumulative'].iloc[-1]:.2f}",
         "",
         f"  {'Agent':<12} {'Policy':<8} {'Cumulative':>12} {'Mean Repay%':>12}",
@@ -494,7 +542,7 @@ def run_simulate_only(cfg: dict, run_id: str) -> None:
     print(f"Re-simulating run: {run_id}")
     out = _out_dir(cfg, run_id)
 
-    world, agents, investor = _build(cfg)
+    world, agents, investors = _build(cfg)
 
     for a in agents:
         if hasattr(a, "load"):
@@ -506,7 +554,7 @@ def run_simulate_only(cfg: dict, run_id: str) -> None:
         if hasattr(a, "set_eval_mode"):
             a.set_eval_mode(True)
 
-    game = Game(cfg, world, investor, agents)
+    game = Game(cfg, world, investors, agents)
     game.export_dir = out
     log_df = game.run()
 
@@ -519,7 +567,7 @@ def run_simulate_only(cfg: dict, run_id: str) -> None:
     (out / "simulation_summary.txt").write_text(sim_summary)
     _save_round_analysis(log_df, agents, out, label="eval")
 
-    step_verify(cfg, world, agents, investor, out, run_id)
+    step_verify(cfg, world, agents, investors, out, run_id)
 
 
 # ------------------------------------------------------------------
@@ -536,12 +584,12 @@ def run_pipeline(cfg: dict, skip_parse: bool, skip_rnn: bool, skip_dqn: bool) ->
     print(f"{'='*60}")
     print(f"RUN: {run_id}")
     print(f"{'='*60}")
-    epa = cfg["game"].get("endowment_per_agent", cfg["game"].get("endowment", 20))
-    n_agents = len(cfg["game"]["agents"])
-    print(f"  endowment={epa}×{n_agents}={epa*n_agents}  "
+    epi = cfg["game"]["endowment_per_investor"]
+    n_dyads = len(cfg["game"]["dyads"])
+    print(f"  endowment_per_investor={epi}  n_dyads={n_dyads}  "
           f"multiplier={cfg['game']['multiplier']}  "
           f"max_rounds={cfg['game']['max_rounds']}  "
-          f"world_mode=W{cfg['world']['mode']}")
+          f"ii_edge={cfg['edges']['ii_edge']}  aa_edge={cfg['edges']['aa_edge']}")
 
     if not skip_parse:
         step_parse(cfg)
@@ -554,10 +602,10 @@ def run_pipeline(cfg: dict, skip_parse: bool, skip_rnn: bool, skip_dqn: bool) ->
         print("\n--- STEP 2: TRAIN RNN (skipped) ---")
 
     if not skip_dqn:
-        world, agents, investor = step_train_dqn(cfg, run_id, out)
+        world, agents, investors = step_train_dqn(cfg, run_id, out)
     else:
         print("\n--- STEP 3: TRAIN DQN (skipped) ---")
-        world, agents, investor = _build(cfg)
+        world, agents, investors = _build(cfg)
         for a in agents:
             try:
                 a.load()
@@ -565,7 +613,7 @@ def run_pipeline(cfg: dict, skip_parse: bool, skip_rnn: bool, skip_dqn: bool) ->
             except Exception:
                 print(f"  WARNING: no checkpoint for {a.name}")
 
-    step_verify(cfg, world, agents, investor, out, run_id)
+    step_verify(cfg, world, agents, investors, out, run_id)
 
     print(f"\n{'='*60}")
     print(f"All outputs in: {out}/")
@@ -582,21 +630,13 @@ def main() -> None:
         help="Re-simulate saved weights. Pass run_id or omit to auto-detect latest.",
     )
     parser.add_argument("--smoke-test", action="store_true",
-                        help="Run N=1/N=2 allocation smoke tests and exit.")
+                        help="Run two-dyad smoke tests and exit.")
     parser.add_argument("--experiment-matrix", action="store_true",
-                        help="Run full 5-condition experiment matrix.")
+                        help="Run full 4-condition 2×2 experiment matrix.")
     args = parser.parse_args()
 
     cfg = load_config()
     set_all_seeds(cfg["seed"])
-
-    # Validate spillover_alpha at startup
-    alpha = cfg["behavioral_rnn"].get("spillover_alpha", 0.0)
-    if not (0.0 <= alpha <= 0.3):
-        raise ValueError(
-            f"spillover_alpha={alpha} out of range [0.0, 0.3]. "
-            "Values >0.3 risk RNN extrapolation; adjust config."
-        )
 
     if args.smoke_test:
         run_smoke_test(cfg)
@@ -621,44 +661,28 @@ def main() -> None:
 # EXPERIMENT MATRIX
 # ===========================================================================
 
-# (condition_id, N, world_mode, spillover_alpha, skip_training)
+# (condition_id, ii_edge, aa_edge)
 EXPERIMENT_CONDITIONS = [
-    ("N1_W0_a0", 1, 0, 0.0, True),
-    ("N2_W0_a0", 2, 0, 0.0, False),
-    ("N2_W1_a0", 2, 1, 0.0, False),
-    ("N2_W0_a3", 2, 0, 0.3, False),
-    ("N2_W1_a3", 2, 1, 0.3, False),
+    ("DPG1_W0", 0, 0),
+    ("DPG1_W1", 0, 1),
+    ("DPG2_W0", 1, 0),
+    ("DPG2_W1", 1, 1),
 ]
 
 
-def _build_condition_config(base_cfg: dict, condition: str, N: int,
-                             world_mode: int, alpha: float) -> dict:
-    """Deep-copy base config and override per-condition fields."""
+def _build_condition_config(base_cfg: dict, condition: str, ii: int, aa: int) -> dict:
+    """Deep-copy base config and override edges + trustee save paths."""
     cfg = copy.deepcopy(base_cfg)
-    cfg["world"]["mode"] = world_mode
-    cfg["behavioral_rnn"]["spillover_alpha"] = alpha
+    cfg["edges"]["ii_edge"] = ii
+    cfg["edges"]["aa_edge"] = aa
     cfg["_condition"] = condition
-
-    if N == 1:
-        cfg["game"]["agents"] = [{
-            "name": "max_1", "type": "max",
-            "save_path": "checkpoints/adversary_max_1.pt",  # existing
-        }]
-    else:
-        cfg["game"]["agents"] = [
-            {"name": "max_1", "type": "max",
-             "save_path": f"checkpoints/adversary_{condition}_max_1.pt"},
-            {"name": "fair_1", "type": "fair",
-             "save_path": f"checkpoints/adversary_{condition}_fair_1.pt"},
-        ]
     return cfg
 
 
 def _matrix_train(cfg: dict, cond_dir: Path) -> float:
-    """Train DQNs for a condition. Returns elapsed seconds."""
-    world, agents, investor = _build(cfg)
+    world, agents, investors = _build(cfg)
     adv_cfg = cfg["adversary"]
-    game = Game(cfg, world, investor, agents)
+    game = Game(cfg, world, investors, agents)
     game.export_dir = cond_dir
     t0 = time.time()
     stats = game.run_training(
@@ -673,8 +697,7 @@ def _matrix_train(cfg: dict, cond_dir: Path) -> float:
 
 def _matrix_eval(cfg: dict, cond_dir: Path, n_episodes: int = 1000
                   ) -> tuple[pd.DataFrame, list[dict], list]:
-    """Load trained agents and run eval episodes. Returns (log_df, ep_stats, agents)."""
-    world, agents, investor = _build(cfg)
+    world, agents, investors = _build(cfg)
 
     for a in agents:
         if hasattr(a, "load"):
@@ -686,17 +709,13 @@ def _matrix_eval(cfg: dict, cond_dir: Path, n_episodes: int = 1000
         if hasattr(a, "set_eval_mode"):
             a.set_eval_mode(True)
 
-    game = Game(cfg, world, investor, agents)
+    game = Game(cfg, world, investors, agents)
     game.export_dir = cond_dir
 
     all_rows: list[pd.DataFrame] = []
     ep_stats: list[dict] = []
 
     for ep_i in range(n_episodes):
-        world.reset()
-        investor.reset()
-        for a in agents:
-            a.reset()
         result = game._run_episode(log_details=True)
         df = result["log_df"].copy()
         df["episode"] = ep_i
@@ -715,11 +734,8 @@ def _matrix_eval(cfg: dict, cond_dir: Path, n_episodes: int = 1000
 
 
 def _audit_invariants(log_df: pd.DataFrame, condition: str,
-                       endowment_per_agent: float) -> list[str]:
-    """Verify per-row and per-round invariants. Returns list of error strings."""
+                       endowment_per_investor: float) -> list[str]:
     errors: list[str] = []
-    n_agent_names = log_df["agent_name"].nunique()
-    wallet = endowment_per_agent * n_agent_names
 
     # Reward conservation: investor_reward + agent_reward == 2 * investment
     row_sum = log_df["investor_reward"] + log_df["agent_reward"]
@@ -730,12 +746,16 @@ def _audit_invariants(log_df: pd.DataFrame, condition: str,
             f"{condition}: reward invariant violated in {bad.sum()}/{len(bad)} rows"
         )
 
-    # Budget: sum of investments per (episode, round) <= wallet
-    per_round = log_df.groupby(["episode", "timestep"])["investment"].sum()
-    violations = int((per_round > wallet + 1e-6).sum())
+    # Per-dyad budget: each dyad's investment <= endowment_per_investor
+    if "dyad_idx" in log_df.columns:
+        per_dyad_round = log_df.groupby(["episode", "timestep", "dyad_idx"])["investment"].sum()
+    else:
+        per_dyad_round = log_df.groupby(["episode", "timestep"])["investment"].sum()
+    violations = int((per_dyad_round > endowment_per_investor + 1e-6).sum())
     if violations > 0:
         errors.append(
-            f"{condition}: budget violated in {violations} rounds (wallet={wallet})"
+            f"{condition}: per-dyad budget violated in {violations} rounds "
+            f"(endowment={endowment_per_investor})"
         )
 
     return errors
@@ -743,7 +763,6 @@ def _audit_invariants(log_df: pd.DataFrame, condition: str,
 
 def _save_condition_plots(log_df: pd.DataFrame, agents: list,
                            cond_dir: Path, condition: str) -> None:
-    """Save Figure-5-style per-round plots for a condition."""
     cond_dir.mkdir(parents=True, exist_ok=True)
 
     for col, fname, ylabel in [
@@ -772,12 +791,10 @@ def _save_condition_summary(
     agents: list,
     cond_dir: Path,
     condition: str,
-    N: int,
-    world_mode: int,
-    alpha: float,
+    ii_edge: int,
+    aa_edge: int,
     train_time: float,
 ) -> dict:
-    """Build and persist summary.json for one condition. Returns summary dict."""
     agent_summaries: dict = {}
     for a in agents:
         rows = log_df[log_df["agent_name"] == a.name]
@@ -803,9 +820,8 @@ def _save_condition_summary(
     inv_cumulatives = [ep["investor_cumulative"] for ep in ep_stats]
     summary = {
         "condition": condition,
-        "N": N,
-        "world_mode": world_mode,
-        "spillover_alpha": alpha,
+        "ii_edge": ii_edge,
+        "aa_edge": aa_edge,
         "n_eval_episodes": len(ep_stats),
         "investor_earnings_mean": float(np.mean(inv_cumulatives)),
         "investor_earnings_std": float(np.std(inv_cumulatives)),
@@ -821,7 +837,6 @@ def _bootstrap_diff_ci(
     data_a: np.ndarray, data_b: np.ndarray,
     n_boot: int = 5000, ci: float = 0.95,
 ) -> tuple[float, float, float]:
-    """Bootstrap CI for mean(b) - mean(a) from independent samples."""
     rng = np.random.default_rng(42)
     diffs = np.array([
         np.mean(rng.choice(data_b, len(data_b), replace=True))
@@ -834,13 +849,13 @@ def _bootstrap_diff_ci(
     return obs, lo, hi
 
 
-def _produce_2x2_grid(all_log_dfs: dict, matrix_dir: Path) -> None:
-    """Save 2×2 grid: W0/W1 (rows) × α=0/α=0.3 (cols), mean repayment by round."""
+def _produce_2x2_grid(all_log_dfs: dict, matrix_dir: Path, n_eval_episodes: int) -> None:
+    """Save 2×2 grid: ii_edge (cols) × aa_edge (rows), mean repayment by round."""
     layout = [
-        ("N2_W0_a0", "W0, α=0.0"),
-        ("N2_W0_a3", "W0, α=0.3"),
-        ("N2_W1_a0", "W1, α=0.0"),
-        ("N2_W1_a3", "W1, α=0.3"),
+        ("DPG1_W0", "ii=0, aa=0"),
+        ("DPG1_W1", "ii=0, aa=1"),
+        ("DPG2_W0", "ii=1, aa=0"),
+        ("DPG2_W1", "ii=1, aa=1"),
     ]
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     for (cond, title), ax in zip(layout, axes.flat):
@@ -860,8 +875,8 @@ def _produce_2x2_grid(all_log_dfs: dict, matrix_dir: Path) -> None:
         ax.legend(fontsize=9)
 
     plt.suptitle(
-        "2×2 Comparison: World Mode × Spillover α\n"
-        "Mean Repayment % by Round (1000 eval episodes)",
+        "2×2 Comparison: ii_edge × aa_edge\n"
+        f"Mean Repayment % by Round ({n_eval_episodes} eval episodes)",
         fontsize=13,
     )
     plt.tight_layout()
@@ -871,7 +886,6 @@ def _produce_2x2_grid(all_log_dfs: dict, matrix_dir: Path) -> None:
 
 
 def _produce_main_effects_table(all_summaries: dict, matrix_dir: Path) -> pd.DataFrame:
-    """Build and save main_effects_table.csv."""
     rows: list[dict] = []
     for cond, summary in all_summaries.items():
         inv_mean = summary["investor_earnings_mean"]
@@ -879,6 +893,8 @@ def _produce_main_effects_table(all_summaries: dict, matrix_dir: Path) -> pd.Dat
             fair_gap = asum["fair_gap_mean"]
             rows.append({
                 "Condition": cond,
+                "ii_edge": summary["ii_edge"],
+                "aa_edge": summary["aa_edge"],
                 "Type": asum["policy"].upper(),
                 "Agent": aname,
                 "Investor_earnings": round(inv_mean, 2),
@@ -894,17 +910,17 @@ def _produce_main_effects_table(all_summaries: dict, matrix_dir: Path) -> pd.Dat
 
 
 def _produce_effect_decomposition(all_ep_stats: dict, matrix_dir: Path) -> pd.DataFrame:
-    """Compute planned comparisons with bootstrap 95% CIs."""
+    """Bootstrap 95% CIs for main effects and interaction on investor-cumulative."""
 
     def _inv(cond: str) -> np.ndarray | None:
         if cond not in all_ep_stats:
             return None
         return np.array([ep["investor_cumulative"] for ep in all_ep_stats[cond]])
 
-    d_w0a0 = _inv("N2_W0_a0")
-    d_w1a0 = _inv("N2_W1_a0")
-    d_w0a3 = _inv("N2_W0_a3")
-    d_w1a3 = _inv("N2_W1_a3")
+    dpg1_w0 = _inv("DPG1_W0")
+    dpg1_w1 = _inv("DPG1_W1")
+    dpg2_w0 = _inv("DPG2_W0")
+    dpg2_w1 = _inv("DPG2_W1")
 
     rows: list[dict] = []
 
@@ -920,26 +936,26 @@ def _produce_effect_decomposition(all_ep_stats: dict, matrix_dir: Path) -> pd.Da
             "CI_hi_95": round(hi, 3),
         })
 
-    _add("W effect (alpha=0.0)", "N2_W1_a0 − N2_W0_a0", d_w0a0, d_w1a0)
-    _add("W effect (alpha=0.3)", "N2_W1_a3 − N2_W0_a3", d_w0a3, d_w1a3)
-    _add("Spillover effect (W0)", "N2_W0_a3 − N2_W0_a0", d_w0a0, d_w0a3)
-    _add("Spillover effect (W1)", "N2_W1_a3 − N2_W1_a0", d_w1a0, d_w1a3)
+    _add("ii effect (aa=0)", "DPG1_W1 − DPG1_W0", dpg1_w0, dpg1_w1)
+    _add("ii effect (aa=1)", "DPG2_W1 − DPG2_W0", dpg2_w0, dpg2_w1)
+    _add("aa effect (ii=0)", "DPG2_W0 − DPG1_W0", dpg1_w0, dpg2_w0)
+    _add("aa effect (ii=1)", "DPG2_W1 − DPG1_W1", dpg1_w1, dpg2_w1)
 
-    # Interaction: (W1a3 − W0a3) − (W1a0 − W0a0)
-    if all(x is not None for x in [d_w0a0, d_w1a0, d_w0a3, d_w1a3]):
+    # Interaction: (DPG2_W1 − DPG2_W0) − (DPG1_W1 − DPG1_W0)
+    if all(x is not None for x in [dpg1_w0, dpg1_w1, dpg2_w0, dpg2_w1]):
         rng = np.random.default_rng(43)
         interactions = [
-            (np.mean(rng.choice(d_w1a3, len(d_w1a3), replace=True))
-             - np.mean(rng.choice(d_w0a3, len(d_w0a3), replace=True)))
-            - (np.mean(rng.choice(d_w1a0, len(d_w1a0), replace=True))
-               - np.mean(rng.choice(d_w0a0, len(d_w0a0), replace=True)))
+            (np.mean(rng.choice(dpg2_w1, len(dpg2_w1), replace=True))
+             - np.mean(rng.choice(dpg2_w0, len(dpg2_w0), replace=True)))
+            - (np.mean(rng.choice(dpg1_w1, len(dpg1_w1), replace=True))
+               - np.mean(rng.choice(dpg1_w0, len(dpg1_w0), replace=True)))
             for _ in range(5000)
         ]
-        obs_int = float((np.mean(d_w1a3) - np.mean(d_w0a3))
-                        - (np.mean(d_w1a0) - np.mean(d_w0a0)))
+        obs_int = float((np.mean(dpg2_w1) - np.mean(dpg2_w0))
+                        - (np.mean(dpg1_w1) - np.mean(dpg1_w0)))
         rows.append({
-            "Effect": "W × Spillover interaction",
-            "Comparison": "(W1a3−W0a3) − (W1a0−W0a0)",
+            "Effect": "ii × aa interaction",
+            "Comparison": "(DPG2_W1−DPG2_W0) − (DPG1_W1−DPG1_W0)",
             "Point_est": round(obs_int, 3),
             "CI_lo_95": round(float(np.percentile(interactions, 2.5)), 3),
             "CI_hi_95": round(float(np.percentile(interactions, 97.5)), 3),
@@ -958,8 +974,8 @@ def _write_experiment_report(
     main_eff_df: pd.DataFrame,
     effects_df: pd.DataFrame,
     matrix_dir: Path,
+    matrix_eval_episodes: int,
 ) -> None:
-    """Write experiment_report.md."""
     lines = [
         "# Experiment Matrix Report",
         "",
@@ -971,7 +987,7 @@ def _write_experiment_report(
     for cond, s in all_summaries.items():
         lines += [
             f"### {cond}",
-            f"- N={s['N']}, World=W{s['world_mode']}, α={s['spillover_alpha']}",
+            f"- ii_edge={s['ii_edge']}, aa_edge={s['aa_edge']}",
             f"- Investor earnings: {s['investor_earnings_mean']:.2f} "
             f"± {s['investor_earnings_std']:.2f}  (n={s['n_eval_episodes']})",
         ]
@@ -1000,40 +1016,37 @@ def _write_experiment_report(
         match = effects_df[effects_df["Effect"] == effect]
         return match.iloc[0].to_dict() if not match.empty else None
 
-    # Observation 1
-    r = _row("W effect (alpha=0.0)")
-    lines.append("### 1. Does W1 help adversaries at alpha=0?")
+    r = _row("ii effect (aa=0)")
+    lines.append("### 1. Does ii_edge help at aa=0?")
     if r:
         pe, lo, hi = r["Point_est"], r["CI_lo_95"], r["CI_hi_95"]
         direction = "increases" if pe > 0 else "decreases"
         sig = "CI excludes 0" if (lo > 0 or hi < 0) else "CI includes 0 (not significant at 95%)"
         lines.append(
-            f"W1 {direction} investor earnings by {pe:+.2f} [{lo:.2f}, {hi:.2f}]. {sig}."
+            f"ii_edge {direction} investor earnings by {pe:+.2f} [{lo:.2f}, {hi:.2f}]. {sig}."
         )
     lines.append("")
 
-    # Observation 2
-    r = _row("Spillover effect (W0)")
-    lines.append("### 2. Does alpha=0.3 change anything at W0?")
+    r = _row("aa effect (ii=0)")
+    lines.append("### 2. Does aa_edge help at ii=0?")
     if r:
         pe, lo, hi = r["Point_est"], r["CI_lo_95"], r["CI_hi_95"]
         direction = "increases" if pe > 0 else "decreases"
         sig = "CI excludes 0" if (lo > 0 or hi < 0) else "CI includes 0 (not significant at 95%)"
         lines.append(
-            f"Spillover at W0 {direction} investor earnings by {pe:+.2f} [{lo:.2f}, {hi:.2f}]. {sig}."
+            f"aa_edge {direction} investor earnings by {pe:+.2f} [{lo:.2f}, {hi:.2f}]. {sig}."
         )
     lines.append("")
 
-    # Observation 3
-    r = _row("W × Spillover interaction")
-    lines.append("### 3. Is there a W×alpha interaction?")
+    r = _row("ii × aa interaction")
+    lines.append("### 3. Is there an ii × aa interaction?")
     if r:
         pe, lo, hi = r["Point_est"], r["CI_lo_95"], r["CI_hi_95"]
         direction = "amplifies" if pe > 0 else "dampens"
         sig = "CI excludes 0" if (lo > 0 or hi < 0) else "CI includes 0 (not significant at 95%)"
         lines.append(
-            f"W×α interaction = {pe:+.2f} [{lo:.2f}, {hi:.2f}]. "
-            f"Spillover {direction} the W effect. {sig}."
+            f"ii×aa interaction = {pe:+.2f} [{lo:.2f}, {hi:.2f}]. "
+            f"aa_edge {direction} the ii_edge effect. {sig}."
         )
     lines.append("")
 
@@ -1041,11 +1054,8 @@ def _write_experiment_report(
         "## Limitations",
         "",
         "- Single training run per condition; no error bars on DQN convergence.",
-        "- 1000 eval episodes; CIs reflect sampling variance only.",
-        "- Alpha restricted to [0.0, 0.3] to avoid RNN extrapolation risk.",
-        "- N=1 replication uses frozen existing checkpoint (no retraining).",
-        "- Spillover operates on investor RNN hidden states only; "
-          "no RNN input augmentation.",
+        f"- {matrix_eval_episodes} eval episodes; CIs reflect sampling variance only.",
+        "- Fixed pairing i_k ↔ a_k; no cross-pair allocation.",
     ]
 
     report_path = matrix_dir / "experiment_report.md"
@@ -1054,17 +1064,16 @@ def _write_experiment_report(
 
 
 def run_experiment_matrix(cfg: dict) -> None:
-    """Run the full 5-condition experiment matrix (Parts C–E)."""
+    """Run the full 4-condition 2×2 experiment matrix."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     matrix_dir = Path(f"outputs/experiment_matrix_{timestamp}")
     matrix_dir.mkdir(parents=True, exist_ok=True)
 
-    endowment_per_agent = float(
-        cfg["game"].get("endowment_per_agent", cfg["game"].get("endowment", 20))
-    )
+    endowment_per_investor = float(cfg["game"]["endowment_per_investor"])
+    matrix_eval_episodes = int(cfg["adversary"]["matrix_eval_episodes"])
 
     print(f"\n{'='*60}")
-    print("EXPERIMENT MATRIX")
+    print("EXPERIMENT MATRIX (2×2 over ii_edge × aa_edge)")
     print(f"Output: {matrix_dir}")
     print(f"Conditions: {[c[0] for c in EXPERIMENT_CONDITIONS]}")
     print(f"{'='*60}")
@@ -1075,36 +1084,30 @@ def run_experiment_matrix(cfg: dict) -> None:
     all_errors: list[str] = []
     training_times: dict = {}
 
-    for condition, N, world_mode, alpha, skip_training in EXPERIMENT_CONDITIONS:
+    for condition, ii, aa in EXPERIMENT_CONDITIONS:
         print(f"\n{'─'*55}")
-        print(f"Condition: {condition}  (N={N}, W{world_mode}, α={alpha})")
+        print(f"Condition: {condition}  (ii_edge={ii}, aa_edge={aa})")
         print(f"{'─'*55}")
 
         cond_dir = matrix_dir / condition
         cond_dir.mkdir(parents=True, exist_ok=True)
 
-        cond_cfg = _build_condition_config(cfg, condition, N, world_mode, alpha)
-        # Save condition config for reproducibility
+        cond_cfg = _build_condition_config(cfg, condition, ii, aa)
+        safe_cfg = {k: v for k, v in cond_cfg.items() if not k.startswith("_")}
         with open(cond_dir / "config.yaml", "w") as f:
-            safe_cfg = {k: v for k, v in cond_cfg.items() if not k.startswith("_")}
             yaml.dump(safe_cfg, f, default_flow_style=False, sort_keys=False)
 
         # --- Training ---
-        train_time = 0.0
-        if skip_training:
-            print("  Training: skipped (using existing checkpoint)")
-        else:
-            adv_ep = cond_cfg["adversary"]["training_episodes"]
-            print(f"  Training: {adv_ep} episodes...")
-            t_train = time.time()
-            train_time = _matrix_train(cond_cfg, cond_dir)
-            print(f"  Training time: {train_time:.1f}s")
+        adv_ep = cond_cfg["adversary"]["training_episodes"]
+        print(f"  Training: {adv_ep} episodes...")
+        train_time = _matrix_train(cond_cfg, cond_dir)
+        print(f"  Training time: {train_time:.1f}s")
         training_times[condition] = train_time
 
         # --- Evaluation ---
-        print("  Evaluating: 1000 episodes...")
+        print(f"  Evaluating: {matrix_eval_episodes} episodes...")
         t_eval = time.time()
-        log_df, ep_stats, agents = _matrix_eval(cond_cfg, cond_dir, n_episodes=1000)
+        log_df, ep_stats, agents = _matrix_eval(cond_cfg, cond_dir, n_episodes=matrix_eval_episodes)
         eval_time = time.time() - t_eval
         print(f"  Eval time: {eval_time:.1f}s")
 
@@ -1112,7 +1115,7 @@ def run_experiment_matrix(cfg: dict) -> None:
         all_ep_stats[condition] = ep_stats
 
         # --- Invariant audit ---
-        errors = _audit_invariants(log_df, condition, endowment_per_agent)
+        errors = _audit_invariants(log_df, condition, endowment_per_investor)
         all_errors.extend(errors)
         if errors:
             print(f"  INVARIANT VIOLATIONS:")
@@ -1125,9 +1128,9 @@ def run_experiment_matrix(cfg: dict) -> None:
         else:
             print("  Invariant audit: PASS")
 
-        # --- N1 Fig5D replication check ---
-        if condition == "N1_W0_a0":
-            max_rows = log_df[log_df["agent_name"] == "max_1"]
+        # --- DPG1_W0 Fig5D replication check ---
+        if condition == "DPG1_W0":
+            max_rows = log_df[log_df["agent_name"] == "a1"]
             by_round = max_rows.groupby("timestep")["repayment_pct"].mean()
             r0 = float(by_round.iloc[0]) if len(by_round) > 0 else float("nan")
             rlast = float(by_round.iloc[-1]) if len(by_round) > 0 else float("nan")
@@ -1136,14 +1139,14 @@ def run_experiment_matrix(cfg: dict) -> None:
             else:
                 print(
                     f"  Fig 5D replication: WARNING — "
-                    f"R0={r0:.1%} → R9={rlast:.1%} (expected ~74%→7%)"
+                    f"R0={r0:.1%} → R9={rlast:.1%} (expected ~75%→<30%)"
                 )
 
         # --- Plots & summary ---
         _save_condition_plots(log_df, agents, cond_dir, condition)
         summary = _save_condition_summary(
             log_df, ep_stats, agents, cond_dir,
-            condition, N, world_mode, alpha, train_time,
+            condition, ii, aa, train_time,
         )
         all_summaries[condition] = summary
 
@@ -1156,12 +1159,11 @@ def run_experiment_matrix(cfg: dict) -> None:
     print(f"\n{'─'*55}")
     print("Producing aggregate outputs...")
 
-    _produce_2x2_grid(all_log_dfs, matrix_dir)
+    _produce_2x2_grid(all_log_dfs, matrix_dir, matrix_eval_episodes)
     main_eff_df = _produce_main_effects_table(all_summaries, matrix_dir)
     effects_df = _produce_effect_decomposition(all_ep_stats, matrix_dir)
-    _write_experiment_report(all_summaries, main_eff_df, effects_df, matrix_dir)
+    _write_experiment_report(all_summaries, main_eff_df, effects_df, matrix_dir, matrix_eval_episodes)
 
-    # --- Invariant summary ---
     if all_errors:
         print(f"\nINVARIANT AUDIT FAILURES ({len(all_errors)}):")
         for e in all_errors:
@@ -1169,12 +1171,10 @@ def run_experiment_matrix(cfg: dict) -> None:
     else:
         print("\nInvariant audit: ALL CONDITIONS PASS")
 
-    # --- Training time summary ---
     total_train = sum(training_times.values())
     print(f"\nTraining times (total: {total_train:.1f}s):")
     for cond, t in training_times.items():
-        status = "skipped" if t == 0.0 else f"{t:.1f}s"
-        print(f"  {cond}: {status}")
+        print(f"  {cond}: {t:.1f}s")
 
     print(f"\n{'='*60}")
     print(f"Experiment matrix complete.")

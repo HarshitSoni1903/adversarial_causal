@@ -1,0 +1,9 @@
+Condition,ii_edge,aa_edge,Type,Agent,Investor_earnings,Agent_earnings,FAIR_gap
+DPG1_W0,0,0,MAX,a1,-20.09,188.15,-
+DPG1_W0,0,0,FAIR,a2,-20.09,115.39,82.29
+DPG1_W1,0,1,MAX,a1,-2.28,187.37,-
+DPG1_W1,0,1,FAIR,a2,-2.28,102.97,57.64
+DPG2_W0,1,0,MAX,a1,16.35,191.5,-
+DPG2_W0,1,0,FAIR,a2,16.35,97.1,53.59
+DPG2_W1,1,1,MAX,a1,32.55,184.03,-
+DPG2_W1,1,1,FAIR,a2,32.55,89.07,33.02

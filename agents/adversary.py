@@ -116,11 +116,11 @@ class DQNAdversary(BaseAgent):
         self.q_learner.load(path or self._save_path())
 
     def _save_path(self) -> str:
-        for a in self.config["game"]["agents"]:
-            if a["name"] == self.name:
-                path = a["save_path"]
+        for d in self.config["game"]["dyads"]:
+            t = d["trustee"]
+            if t["name"] == self.name:
+                path = t["save_path"]
                 if "{condition}" in path:
-                    condition = self.config.get("_condition", "")
-                    path = path.replace("{condition}", condition)
+                    path = path.replace("{condition}", self.config.get("_condition", ""))
                 return path
         return f"checkpoints/{self.name}.pt"

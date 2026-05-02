@@ -1,15 +1,12 @@
-"""World: constructs observation vectors for adversary agents (multi-agent extension).
+"""World: tracks per-dyad history and provides cross-pair observations.
 
-At N=1 the others observation is always empty, so W0 and W1 produce identical
-adversary states. This is a verified invariant of the N=1 Dezfouli replication.
+Two independent edge flags control information flow:
+  ii_edge — investors observe each other (cross-investor GRU update).
+  aa_edge — trustees observe each other (cross-pair window in DQN state).
 
-At N>=2:
-  W0 (mode=0): others observation zeroed — adversaries play independently.
-  W1 (mode=1): others observation contains real values — adversaries can see
-               each other's last-d-round history.
-
-The world is part of the multi-agent EXTENSION layer. Core Dezfouli replication
-(N=1) does not use any world observation.
+The World stores per-dyad (invest, repay) history and the previous-round
+(action_onehot, repay_prop) for the snapshot-safe cross-investor update.
+Cross-step inputs come from World, not from the other investor's cache.
 """
 
 import numpy as np
@@ -19,51 +16,61 @@ class World:
 
     def __init__(
         self,
-        mode: int,
+        ii_edge: int,
+        aa_edge: int,
         observation_depth: int,
-        agent_names: list[str],
+        dyad_pairs: list[tuple[str, str]],
+        n_actions: int,
     ) -> None:
-        self.mode = mode                        # 0=W0, 1=W1
-        self.communication = (mode == 1)        # backward-compat alias
+        self.ii_edge = ii_edge
+        self.aa_edge = aa_edge
         self.observation_depth = observation_depth
-        self.agent_names = agent_names
-        self.history: dict[str, list[tuple[float, float]]] = {
-            name: [] for name in agent_names
-        }
+        self.n_dyads = len(dyad_pairs)
+        self.n_actions = n_actions
+        self.history: list[list[tuple[float, float]]] = [[] for _ in range(self.n_dyads)]
+        self._last_ah: list[np.ndarray] = [
+            np.zeros(n_actions, dtype=np.float32) for _ in range(self.n_dyads)
+        ]
+        self._last_rp: list[float] = [0.0] * self.n_dyads
 
     def reset(self) -> None:
-        for name in self.agent_names:
-            self.history[name] = []
+        for k in range(self.n_dyads):
+            self.history[k] = []
+            self._last_ah[k] = np.zeros(self.n_actions, dtype=np.float32)
+            self._last_rp[k] = 0.0
 
-    def record_step(
-        self, agent_name: str, investment: float, repayment: float,
+    def record_dyad_step(
+        self,
+        k: int,
+        invest: float,
+        repay: float,
+        action_oh: np.ndarray,
+        repay_prop: float,
     ) -> None:
-        self.history[agent_name].append((investment, repayment))
+        self.history[k].append((invest, repay))
+        self._last_ah[k] = action_oh.copy()
+        self._last_rp[k] = repay_prop
 
-    def get_others_observation(self, agent_name: str) -> np.ndarray:
-        """Last d (investment, repayment) pairs per other agent, zeroed in W0.
+    def get_other_pair_window(self, k: int) -> np.ndarray:
+        """Last observation_depth (invest, repay) pairs from the other dyad, zero-padded.
 
-        Shape: (observation_depth * 2 * (N-1),)
-        At N=1: empty array (0-dim).
+        Returns shape (2 * observation_depth,).
         """
+        other_k = 1 - k
         d = self.observation_depth
+        hist = self.history[other_k]
+        window = hist[-d:]
+        pad_len = d - len(window)
+        padded = [(0.0, 0.0)] * pad_len + list(window)
         result: list[float] = []
-        for name in self.agent_names:
-            if name == agent_name:
-                continue
-            hist = self.history[name]
-            window = hist[-d:] if self.communication else []
-            pad_len = d - len(window)
-            padded = [(0.0, 0.0)] * pad_len + list(window)
-            for inv, rep in padded:
-                result.extend([inv, rep])
+        for inv, rep in padded:
+            result.extend([inv, rep])
         return np.array(result, dtype=np.float32)
 
-    def others_obs_dim(self, agent_name: str | None = None) -> int:
-        """Dimension of the others observation for any agent (same for all)."""
-        n_others = len(self.agent_names) - 1
-        return self.observation_depth * 2 * n_others
+    def get_other_pair_last_action_repay(self, k: int) -> tuple[np.ndarray, float]:
+        """Previous-round (action_onehot, repay_prop) from the other dyad.
 
-    def total_obs_dim(self) -> int:
-        """Total others-observation dimension (same for all agents)."""
-        return self.others_obs_dim()
+        Returns zeros at t=0 (before any round is recorded).
+        """
+        other_k = 1 - k
+        return self._last_ah[other_k].copy(), self._last_rp[other_k]

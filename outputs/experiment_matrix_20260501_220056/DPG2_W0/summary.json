@@ -1,0 +1,47 @@
+{
+  "condition": "DPG2_W0",
+  "ii_edge": 1,
+  "aa_edge": 0,
+  "n_eval_episodes": 1000,
+  "investor_earnings_mean": 16.35375,
+  "investor_earnings_std": 76.80568125755738,
+  "train_time_seconds": 162.17954277992249,
+  "agents": {
+    "a1": {
+      "policy": "max",
+      "mean_reward": 191.4975,
+      "std_reward": 138.2634532107093,
+      "mean_repayment_by_round": {
+        "0": 0.47925,
+        "1": 0.2825,
+        "2": 0.25575,
+        "3": 0.24625,
+        "4": 0.22125,
+        "5": 0.0125,
+        "6": 0.0075,
+        "7": 0.0925,
+        "8": 0.1105,
+        "9": 0.11675
+      },
+      "fair_gap_mean": null
+    },
+    "a2": {
+      "policy": "fair",
+      "mean_reward": 97.09875,
+      "std_reward": 59.9286549651959,
+      "mean_repayment_by_round": {
+        "0": 0.4435,
+        "1": 0.3795,
+        "2": 0.5315,
+        "3": 0.63975,
+        "4": 0.7115,
+        "5": 0.749,
+        "6": 0.75,
+        "7": 0.75,
+        "8": 0.75,
+        "9": 0.75
+      },
+      "fair_gap_mean": 53.5875
+    }
+  }
+}

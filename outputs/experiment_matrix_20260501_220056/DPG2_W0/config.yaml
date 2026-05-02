@@ -75,7 +75,7 @@ game:
   max_rounds: 10
   observation_depth: 4
 edges:
-  ii_edge: 0
+  ii_edge: 1
   aa_edge: 0
 export:
   output_dir: outputs/

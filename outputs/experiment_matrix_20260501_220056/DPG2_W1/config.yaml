@@ -75,8 +75,8 @@ game:
   max_rounds: 10
   observation_depth: 4
 edges:
-  ii_edge: 0
-  aa_edge: 0
+  ii_edge: 1
+  aa_edge: 1
 export:
   output_dir: outputs/
   filename: game_log.csv

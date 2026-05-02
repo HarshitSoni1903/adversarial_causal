@@ -1,0 +1,6 @@
+Effect,Comparison,Point_est,CI_lo_95,CI_hi_95
+ii effect (aa=0),DPG1_W1 − DPG1_W0,17.814,12.652,23.097
+ii effect (aa=1),DPG2_W1 − DPG2_W0,16.191,9.273,22.999
+aa effect (ii=0),DPG2_W0 − DPG1_W0,36.448,30.819,42.361
+aa effect (ii=1),DPG2_W1 − DPG1_W1,34.825,28.625,41.216
+ii × aa interaction,(DPG2_W1−DPG2_W0) − (DPG1_W1−DPG1_W0),-1.622,-10.234,6.666
