@@ -15,6 +15,9 @@
       "Bash(python3 run_gamma_sweep.py)",
       "Bash(tee outputs/gamma_sweep_console.log)",
       "Bash(tee outputs/gamma_seed_sweep_console.log)"
+    ],
+    "additionalDirectories": [
+      "/Users/hsoni/Downloads/Adversarial_MRTT"
     ]
   }
 }

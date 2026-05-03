@@ -833,6 +833,236 @@ def _save_condition_summary(
     return summary
 
 
+def _bootstrap_diff_ci(
+    data_a: np.ndarray, data_b: np.ndarray,
+    n_boot: int = 5000, ci: float = 0.95,
+) -> tuple[float, float, float]:
+    rng = np.random.default_rng(42)
+    diffs = np.array([
+        np.mean(rng.choice(data_b, len(data_b), replace=True))
+        - np.mean(rng.choice(data_a, len(data_a), replace=True))
+        for _ in range(n_boot)
+    ])
+    obs = float(np.mean(data_b) - np.mean(data_a))
+    lo = float(np.percentile(diffs, (1 - ci) / 2 * 100))
+    hi = float(np.percentile(diffs, (1 + ci) / 2 * 100))
+    return obs, lo, hi
+
+
+def _produce_2x2_grid(all_log_dfs: dict, matrix_dir: Path, n_eval_episodes: int) -> None:
+    """Save 2×2 grid: ii_edge (cols) × aa_edge (rows), mean repayment by round."""
+    layout = [
+        ("DPG1_W0", "ii=0, aa=0"),
+        ("DPG1_W1", "ii=0, aa=1"),
+        ("DPG2_W0", "ii=1, aa=0"),
+        ("DPG2_W1", "ii=1, aa=1"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    for (cond, title), ax in zip(layout, axes.flat):
+        if cond not in all_log_dfs:
+            ax.set_title(f"{title}\n(missing)")
+            continue
+        log_df = all_log_dfs[cond]
+        ax.set_title(title, fontsize=12)
+        for aname in sorted(log_df["agent_name"].unique()):
+            rows = log_df[log_df["agent_name"] == aname]
+            policy = rows["agent_type"].iloc[0] if not rows.empty else aname
+            by_round = rows.groupby("timestep")["repayment_pct"].mean()
+            ax.plot(by_round.index, by_round.values,
+                    label=f"{aname} ({policy})", marker="o", ms=4)
+        ax.set(xlabel="Round", ylabel="Mean Repayment %")
+        ax.set_ylim(-0.05, 1.05)
+        ax.legend(fontsize=9)
+
+    plt.suptitle(
+        "2×2 Comparison: ii_edge × aa_edge\n"
+        f"Mean Repayment % by Round ({n_eval_episodes} eval episodes)",
+        fontsize=13,
+    )
+    plt.tight_layout()
+    plt.savefig(matrix_dir / "comparison_2x2_grid.png", dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {matrix_dir / 'comparison_2x2_grid.png'}")
+
+
+def _produce_main_effects_table(all_summaries: dict, matrix_dir: Path) -> pd.DataFrame:
+    rows: list[dict] = []
+    for cond, summary in all_summaries.items():
+        inv_mean = summary["investor_earnings_mean"]
+        for aname, asum in summary["agents"].items():
+            fair_gap = asum["fair_gap_mean"]
+            rows.append({
+                "Condition": cond,
+                "ii_edge": summary["ii_edge"],
+                "aa_edge": summary["aa_edge"],
+                "Type": asum["policy"].upper(),
+                "Agent": aname,
+                "Investor_earnings": round(inv_mean, 2),
+                "Agent_earnings": round(asum["mean_reward"], 2),
+                "FAIR_gap": round(fair_gap, 2) if fair_gap is not None else "-",
+            })
+    df = pd.DataFrame(rows)
+    csv_path = matrix_dir / "main_effects_table.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\nMain effects table ({csv_path}):")
+    print(df.to_string(index=False))
+    return df
+
+
+def _produce_effect_decomposition(all_ep_stats: dict, matrix_dir: Path) -> pd.DataFrame:
+    """Bootstrap 95% CIs for main effects and interaction on investor-cumulative."""
+
+    def _inv(cond: str) -> np.ndarray | None:
+        if cond not in all_ep_stats:
+            return None
+        return np.array([ep["investor_cumulative"] for ep in all_ep_stats[cond]])
+
+    dpg1_w0 = _inv("DPG1_W0")
+    dpg1_w1 = _inv("DPG1_W1")
+    dpg2_w0 = _inv("DPG2_W0")
+    dpg2_w1 = _inv("DPG2_W1")
+
+    rows: list[dict] = []
+
+    def _add(label: str, comp: str, a: np.ndarray | None, b: np.ndarray | None) -> None:
+        if a is None or b is None:
+            return
+        obs, lo, hi = _bootstrap_diff_ci(a, b)
+        rows.append({
+            "Effect": label,
+            "Comparison": comp,
+            "Point_est": round(obs, 3),
+            "CI_lo_95": round(lo, 3),
+            "CI_hi_95": round(hi, 3),
+        })
+
+    _add("ii effect (aa=0)", "DPG1_W1 − DPG1_W0", dpg1_w0, dpg1_w1)
+    _add("ii effect (aa=1)", "DPG2_W1 − DPG2_W0", dpg2_w0, dpg2_w1)
+    _add("aa effect (ii=0)", "DPG2_W0 − DPG1_W0", dpg1_w0, dpg2_w0)
+    _add("aa effect (ii=1)", "DPG2_W1 − DPG1_W1", dpg1_w1, dpg2_w1)
+
+    # Interaction: (DPG2_W1 − DPG2_W0) − (DPG1_W1 − DPG1_W0)
+    if all(x is not None for x in [dpg1_w0, dpg1_w1, dpg2_w0, dpg2_w1]):
+        rng = np.random.default_rng(43)
+        interactions = [
+            (np.mean(rng.choice(dpg2_w1, len(dpg2_w1), replace=True))
+             - np.mean(rng.choice(dpg2_w0, len(dpg2_w0), replace=True)))
+            - (np.mean(rng.choice(dpg1_w1, len(dpg1_w1), replace=True))
+               - np.mean(rng.choice(dpg1_w0, len(dpg1_w0), replace=True)))
+            for _ in range(5000)
+        ]
+        obs_int = float((np.mean(dpg2_w1) - np.mean(dpg2_w0))
+                        - (np.mean(dpg1_w1) - np.mean(dpg1_w0)))
+        rows.append({
+            "Effect": "ii × aa interaction",
+            "Comparison": "(DPG2_W1−DPG2_W0) − (DPG1_W1−DPG1_W0)",
+            "Point_est": round(obs_int, 3),
+            "CI_lo_95": round(float(np.percentile(interactions, 2.5)), 3),
+            "CI_hi_95": round(float(np.percentile(interactions, 97.5)), 3),
+        })
+
+    df = pd.DataFrame(rows)
+    csv_path = matrix_dir / "effect_decomposition.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\nEffect decomposition ({csv_path}):")
+    print(df.to_string(index=False))
+    return df
+
+
+def _write_experiment_report(
+    all_summaries: dict,
+    main_eff_df: pd.DataFrame,
+    effects_df: pd.DataFrame,
+    matrix_dir: Path,
+    matrix_eval_episodes: int,
+) -> None:
+    lines = [
+        "# Experiment Matrix Report",
+        "",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "## Condition Summaries",
+        "",
+    ]
+    for cond, s in all_summaries.items():
+        lines += [
+            f"### {cond}",
+            f"- ii_edge={s['ii_edge']}, aa_edge={s['aa_edge']}",
+            f"- Investor earnings: {s['investor_earnings_mean']:.2f} "
+            f"± {s['investor_earnings_std']:.2f}  (n={s['n_eval_episodes']})",
+        ]
+        for aname, asum in s["agents"].items():
+            fg = f", FAIR gap={asum['fair_gap_mean']:.2f}" if asum["fair_gap_mean"] is not None else ""
+            lines.append(
+                f"- {aname} ({asum['policy']}): reward={asum['mean_reward']:.2f}"
+                f" ± {asum['std_reward']:.2f}{fg}"
+            )
+        if s["train_time_seconds"] > 0:
+            lines.append(f"- Training time: {s['train_time_seconds']:.1f}s")
+        lines.append("")
+
+    lines += ["## Main Effects Table", ""]
+    lines.append(main_eff_df.to_string(index=False))
+    lines += ["", "## Effect Decomposition (95% bootstrap CI)", ""]
+    if not effects_df.empty:
+        lines.append(effects_df.to_string(index=False))
+    lines.append("")
+
+    lines += ["## Observations", ""]
+
+    def _row(effect: str) -> dict | None:
+        if effects_df.empty:
+            return None
+        match = effects_df[effects_df["Effect"] == effect]
+        return match.iloc[0].to_dict() if not match.empty else None
+
+    r = _row("ii effect (aa=0)")
+    lines.append("### 1. Does ii_edge help at aa=0?")
+    if r:
+        pe, lo, hi = r["Point_est"], r["CI_lo_95"], r["CI_hi_95"]
+        direction = "increases" if pe > 0 else "decreases"
+        sig = "CI excludes 0" if (lo > 0 or hi < 0) else "CI includes 0 (not significant at 95%)"
+        lines.append(
+            f"ii_edge {direction} investor earnings by {pe:+.2f} [{lo:.2f}, {hi:.2f}]. {sig}."
+        )
+    lines.append("")
+
+    r = _row("aa effect (ii=0)")
+    lines.append("### 2. Does aa_edge help at ii=0?")
+    if r:
+        pe, lo, hi = r["Point_est"], r["CI_lo_95"], r["CI_hi_95"]
+        direction = "increases" if pe > 0 else "decreases"
+        sig = "CI excludes 0" if (lo > 0 or hi < 0) else "CI includes 0 (not significant at 95%)"
+        lines.append(
+            f"aa_edge {direction} investor earnings by {pe:+.2f} [{lo:.2f}, {hi:.2f}]. {sig}."
+        )
+    lines.append("")
+
+    r = _row("ii × aa interaction")
+    lines.append("### 3. Is there an ii × aa interaction?")
+    if r:
+        pe, lo, hi = r["Point_est"], r["CI_lo_95"], r["CI_hi_95"]
+        direction = "amplifies" if pe > 0 else "dampens"
+        sig = "CI excludes 0" if (lo > 0 or hi < 0) else "CI includes 0 (not significant at 95%)"
+        lines.append(
+            f"ii×aa interaction = {pe:+.2f} [{lo:.2f}, {hi:.2f}]. "
+            f"aa_edge {direction} the ii_edge effect. {sig}."
+        )
+    lines.append("")
+
+    lines += [
+        "## Limitations",
+        "",
+        "- Single training run per condition; no error bars on DQN convergence.",
+        f"- {matrix_eval_episodes} eval episodes; CIs reflect sampling variance only.",
+        "- Fixed pairing i_k ↔ a_k; no cross-pair allocation.",
+    ]
+
+    report_path = matrix_dir / "experiment_report.md"
+    report_path.write_text("\n".join(lines) + "\n")
+    print(f"\nExperiment report: {report_path}")
+
+
 def run_experiment_matrix(cfg: dict) -> None:
     """Run the full 4-condition 2×2 experiment matrix."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -848,6 +1078,9 @@ def run_experiment_matrix(cfg: dict) -> None:
     print(f"Conditions: {[c[0] for c in EXPERIMENT_CONDITIONS]}")
     print(f"{'='*60}")
 
+    all_log_dfs: dict = {}
+    all_ep_stats: dict = {}
+    all_summaries: dict = {}
     all_errors: list[str] = []
     training_times: dict = {}
 
@@ -877,6 +1110,9 @@ def run_experiment_matrix(cfg: dict) -> None:
         log_df, ep_stats, agents = _matrix_eval(cond_cfg, cond_dir, n_episodes=matrix_eval_episodes)
         eval_time = time.time() - t_eval
         print(f"  Eval time: {eval_time:.1f}s")
+
+        all_log_dfs[condition] = log_df
+        all_ep_stats[condition] = ep_stats
 
         # --- Invariant audit ---
         errors = _audit_invariants(log_df, condition, endowment_per_investor)
@@ -912,11 +1148,21 @@ def run_experiment_matrix(cfg: dict) -> None:
             log_df, ep_stats, agents, cond_dir,
             condition, ii, aa, train_time,
         )
+        all_summaries[condition] = summary
 
         inv_mean = summary["investor_earnings_mean"]
         print(f"  Investor mean earnings: {inv_mean:+.1f}")
         for aname, asum in summary["agents"].items():
             print(f"  {aname} ({asum['policy']}): reward={asum['mean_reward']:+.1f}")
+
+    # --- Aggregate outputs ---
+    print(f"\n{'─'*55}")
+    print("Producing aggregate outputs...")
+
+    _produce_2x2_grid(all_log_dfs, matrix_dir, matrix_eval_episodes)
+    main_eff_df = _produce_main_effects_table(all_summaries, matrix_dir)
+    effects_df = _produce_effect_decomposition(all_ep_stats, matrix_dir)
+    _write_experiment_report(all_summaries, main_eff_df, effects_df, matrix_dir, matrix_eval_episodes)
 
     if all_errors:
         print(f"\nINVARIANT AUDIT FAILURES ({len(all_errors)}):")
@@ -933,7 +1179,6 @@ def run_experiment_matrix(cfg: dict) -> None:
     print(f"\n{'='*60}")
     print(f"Experiment matrix complete.")
     print(f"All outputs in: {matrix_dir}/")
-    print(f"Run causal analysis:  Rscript analysis.R {matrix_dir}")
     print(f"{'='*60}")
 
 
