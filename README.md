@@ -152,5 +152,5 @@ Dezfouli, A., Nock, R., & Dayan, P. (2020). Adversarial vulnerabilities of human
 
 ## Collaborators
 
-- **Harshit Soni** (hs5666) — simulation framework, DQN adversaries, experiment design
-- **Gabriel Nixon Raj** (gr2513) — causal inference / SCM component (g-computation, DML over hidden state)
+- **Harshit Soni** (hs5666)
+- **Gabriel Nixon Raj** (gr2513)
