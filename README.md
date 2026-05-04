@@ -148,12 +148,6 @@ Look at `DPG1_W0/figure5c_mean_repayment.png` for agent `a1` (MAX trustee). The 
 
 ---
 
-## Reference
-
-Dezfouli, A., Nock, R., & Dayan, P. (2020). Adversarial vulnerabilities of human decision-making. *Proceedings of the National Academy of Sciences*, 117(46), 29221–29228. https://doi.org/10.1073/pnas.2016921117
-
----
-
 ## Collaborators
 
 - **Harshit Soni** (hs5666)
