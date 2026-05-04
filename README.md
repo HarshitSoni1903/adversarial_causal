@@ -1,7 +1,4 @@
-<<<<<<< HEAD
 # Adversarial Causal Learning
-=======
-# Adversarial MRTT
 
 Multi-agent adversarial extension of the Multi-Round Trust Task, with causal inference over learned hidden states.
 
@@ -157,4 +154,3 @@ Dezfouli, A., Nock, R., & Dayan, P. (2020). Adversarial vulnerabilities of human
 
 - **Harshit Soni** (hs5666) — simulation framework, DQN adversaries, experiment design
 - **Gabriel Nixon Raj** (gr2513) — causal inference / SCM component (g-computation, DML over hidden state)
->>>>>>> 36ab2d2 (Added Readme)
