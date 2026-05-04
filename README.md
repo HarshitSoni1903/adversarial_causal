@@ -18,6 +18,7 @@ The key manipulation is a 2×2 design over two binary edges: **ii_edge** (whethe
 config.yaml                  # All hyperparameters and experiment knobs
 main.py                      # Entry point: training, evaluation, experiment matrix
 analysis.R                   # Causal analysis and EDA — runs main.py or analyses existing outputs
+CausalProject.r              # All the causal analysis and figure generation
 
 game.py                      # Game loop: resolves investments, repayments, rewards per round
 world.py                     # Shared state: inter-agent edges, observation routing
