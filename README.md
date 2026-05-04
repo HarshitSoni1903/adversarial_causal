@@ -50,7 +50,7 @@ outputs/
     experiment_report.md
 
 simulation_results_matrix/
-#All the figures and tables generated from CausalProject.r
+# All the figures and tables generated from CausalProject.r
 ```
 
 ---
