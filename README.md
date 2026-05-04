@@ -48,6 +48,8 @@ outputs/
     effect_decomposition.csv
     main_effects_table.csv
     experiment_report.md
+
+ simulation_results_matrix #All the figures and tables generated from CausalProject.r
 ```
 
 ---
